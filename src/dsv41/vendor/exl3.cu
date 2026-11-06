@@ -1076,8 +1076,15 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const GArgs a) {
     constexpr int W = 8 * K;
     __shared__ __align__(16) unsigned char sm[2 * BM * 128 * 4];   // A_g, A_u, then the two F32 tiles
     __shared__ uint32_t stage[kWarps][64];
+#ifdef STRATA_USE_PPU
+    // Scalar bases avoid shared-to-generic address casts in aggregate pointer
+    // initializers, which the PPU LLVM backend cannot lower.
+    __half* A = reinterpret_cast<__half*>(sm);
+    float* T = reinterpret_cast<float*>(sm);
+#else
     __half* A[2] = {reinterpret_cast<__half*>(sm), reinterpret_cast<__half*>(sm) + BM * AP};
     float* T[2] = {reinterpret_cast<float*>(sm), reinterpret_cast<float*>(sm) + BM * 128};
+#endif
     const int e = blockIdx.z, rb = blockIdx.x, g = blockIdx.y;
     const int e0 = a.bounds[e] - a.row0, ne = a.bounds[e + 1] - a.bounds[e];
     const int r0 = e0 + rb * BM, nrows = min(BM, ne - rb * BM);
@@ -1088,7 +1095,12 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const GArgs a) {
     for (int k0 = 0; k0 < a.k; k0 += 128) {
         __syncthreads();
         for (int m = 0; m < 2; ++m)
+#ifdef STRATA_USE_PPU
+            load_a(a.xf, a.idx, a.xh, a.ldx, r0, nrows, k0, (const uint16_t*) (blob + a.suh[m]),
+                   A + m * (BM * AP));
+#else
             load_a(a.xf, a.idx, a.xh, a.ldx, r0, nrows, k0, (const uint16_t*) (blob + a.suh[m]), A[m]);
+#endif
         __syncthreads();
 #pragma unroll 1
         for (int s = 0; s < 8; ++s) {
@@ -1104,7 +1116,11 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const GArgs a) {
 #pragma unroll
                 for (int mt = 0; mt < MT; ++mt) {
                     uint32_t af[4];
+#ifdef STRATA_USE_PPU
+                    a_frags(A + m * (BM * AP), mt, s, lane, af);
+#else
                     a_frags(A[m], mt, s, lane, af);
+#endif
                     mma16816(acc[m][mt][0], af, b[0], b[1]);
                     mma16816(acc[m][mt][1], af, b[2], b[3]);
                 }
@@ -1112,8 +1128,13 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const GArgs a) {
         }
     }
     __syncthreads();
+#ifdef STRATA_USE_PPU
+    store_acc(acc[0], T);
+    store_acc(acc[1], T + BM * 128);
+#else
     store_acc(acc[0], T[0]);
     store_acc(acc[1], T[1]);
+#endif
     __syncthreads();
     const uint16_t* svg = (const uint16_t*) (a.wbase + (size_t) e * a.stride + a.svh[0]) + g * 128;
     const uint16_t* svu = (const uint16_t*) (a.wbase + (size_t) e * a.stride + a.svh[1]) + g * 128;
@@ -1121,8 +1142,13 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const GArgs a) {
         float vg[4], vu[4];
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
+#ifdef STRATA_USE_PPU
+            vg[i] = T[rr * 128 + lane * 4 + i];
+            vu[i] = (T + BM * 128)[rr * 128 + lane * 4 + i];
+#else
             vg[i] = T[0][rr * 128 + lane * 4 + i];
             vu[i] = T[1][rr * 128 + lane * 4 + i];
+#endif
         }
         had128(vg, lane);
         had128(vu, lane);

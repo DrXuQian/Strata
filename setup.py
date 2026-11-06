@@ -10317,7 +10317,7 @@ def main() -> int:
         if why:
             (warn if cuda_tk == 13 or str(a.cuda) == "12" else ok)(f"CUDA {cuda_tk}: {why}")
         min_driver = CUDA12_COMPAT_DRIVER if cuda_tk == 12 else MIN_DRIVER
-        if driver_major(gpu) < min_driver:
+        if driver_major(gpu) < min_driver and os.environ.get("STRATA_SKIP_DRIVER_CHECK") != "1":
             fail(f"the NVIDIA driver is too old ({gpu['driver']}; {min_driver} or newer is needed)"
                  + ("" if cuda_tk == 12 else f" (the CUDA 12 engine package needs {cuda12_min_driver()[1]} or newer, {cuda12_min_driver()[2]})"),
                  "update it with the NVIDIA App or from https://www.nvidia.com/drivers, restart, and run this again")

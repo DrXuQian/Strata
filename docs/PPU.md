@@ -94,6 +94,10 @@ to ON only in a PPU build. The same environment variable names accept `0`,
 `false` or `off` to disable individual libraries at process startup.
 `STRATA_NCP_GDN_CHUNKED=0` selects recurrent GDN for prompt processing too.
 
+When using `setup.py`, `STRATA_SKIP_DRIVER_CHECK=1` skips its minimum NVIDIA
+driver-version check for the PPU compatibility runtime. The default check stays
+enabled. Select the PPU compiler and backend with the CMake options above.
+
 Missing libraries, old FA symbols and unsupported shapes keep the existing
 Strata computation. GDN module-load and workspace errors are reported as errors.
 The adapter does not write carried state until the whole NCP operation succeeds;
