@@ -6291,7 +6291,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         L.n_embd <= INT_MAX && L.n_ff <= INT_MAX / 2 &&
         strata::ppu::quactlize::grouped(grp_ptr, grp_start, n_groups, ent_tok, nullptr,
             (int) cap_groups, (int) cap_entries, x_q8_1, 0, L.gu_type, (int) (2 * L.n_ff), (int) L.n_embd,
-            gate, up, stream)) {
+            gate, up, stream, L.quact_packed)) {
         const long long nh = (long long) cap_entries * L.n_ff;
         swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
         if (L.had_block > 0) hadamard_rows(h, h, cap_entries, L.n_ff, L.had_block, L.d_signs, s);
@@ -6313,6 +6313,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         }
         check("native_expert_grouped/quactlize");
         return;
+    }
+    if (L.quact_packed) {
+        std::fprintf(stderr,"quactlize: offline grouped weights require prepared scratch; increase STRATA_QUACTLIZE_SCRATCH_MIB\n");
+        std::exit(1);
     }
 #endif
 #if !STRATA_EXPERT_NIBBLE_BUILT

@@ -1,3 +1,7 @@
+#ifdef STRATA_QUACTLIZE
+#include "strata/ppu/offline.hpp"
+#include "strata/ppu/offline_experts.hpp"
+#endif
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
 #include "strata/core/expert_nibble.hpp"
@@ -5328,6 +5332,12 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
                                         "it computes resident experts as GGUF blocks and fills slots with GGUF blobs");
 #endif
 
+#ifdef STRATA_QUACTLIZE
+        if (strata::ppu::offline::layer((int)d.layers)) {
+            d.failed=true;d.fail="offline quactlize experts require the native verifier";return;
+        }
+#endif
+
         // ================================ THE DECISION, ONCE, ON THIS LAYER'S IDS ================================
         //
         // Every routed expert is asked of the cache.  Resident -> the GPU computes it.  Not resident -> it is
@@ -6532,8 +6542,16 @@ void ForesightSwap::request_locked(ExpertSource* src, int64_t layer, int32_t exp
     const int c = layer_card[(size_t) layer];
     if (card_round[(size_t) c] != now) { card_round[(size_t) c] = now; card_used[(size_t) c] = 0; }
     if (card_used[(size_t) c] >= budget) { ++over_budget; return; }
+#ifdef STRATA_QUACTLIZE
+    // The filler thread can stage the immutable offline mapping. Its bytes must
+    // match the residency cache: landed predictions join the same GPU groups.
+    const bool packed = strata::ppu::offline::layer((int) layer);
+    if (!packed && (src == nullptr || !src->pinned(layer, expert))) return;
+    const uint8_t* b = packed ? strata::ppu::offline::gpu_blob(src, layer, expert) : src->blob(layer, expert);
+#else
     if (src == nullptr || !src->pinned(layer, expert)) return;   // async copies need the pinned arena
     const uint8_t* b = src->blob(layer, expert);
+#endif
     if (b == nullptr) return;
     int best = -1;
     uint64_t best_ref = ~0ull;

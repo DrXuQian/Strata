@@ -92,7 +92,7 @@ This does not implement persistent BF16 expert repacking, grouped multi-expert
 NCP decode, NCP state snapshots, or NCP FA decode with device-side lengths.
 DeepSeek and the separate `strata-split` engine are rejected by this build mode.
 
-## Quactlize and online shuffle
+## Quactlize
 
 Build with `-DSTRATA_QUACTLIZE=ON` (the PPU build's default), then opt in at
 process startup with `STRATA_QUACTLIZE=1`. The runtime default is off. This uses
@@ -127,8 +127,8 @@ multiple of 512. Flash-Next's merged gate/up is N=1280, K=2560. Its individual
 retain their original expert kernels; enabling quactlize does not change their
 quantization format.
 
-**Dynamic experts are shuffled again after selection, not permanently shuffled
-inside the residency cache.** Their raw pointers can change content during
+Without `STRATA_QUACTLIZE_PACK`, dynamic experts are shuffled again after
+selection. Their raw pointers can change content during
 adaptive swaps, PCIe staging and prompt loans. No packed expert is cached by
 pointer, and graph replay repacks the current contents without reading IDs on
 the host. This preserves CPU offload, prefetch and cache policies. It adds GPU
@@ -139,21 +139,20 @@ The original GPU GGUF bytes also remain for immutable matrices so existing
 fused, sliced and fallback readers stay valid. `STRATA_QUACTLIZE_CACHE_MIB`
 bounds the additional resident copies per device (default 256 MiB, 0 disables
 those copies). `STRATA_QUACTLIZE_SCRATCH_MIB` bounds all retained temporary
-allocations per device (default 256 MiB). Allocation failure or budget exhaustion
+allocations per device (default 256 MiB). For raw inputs, allocation failure or budget exhaustion
 uses the original reader before any work is submitted. These are allocation
 budgets, not pre-reserved memory. The resident copies are charged in the native
 dense allocation report and logged individually at load.
 
 Scratch belongs to each output allocation/operation. It can grow outside
 capture; older storage is retained for live graphs and counts against the
-budget. A capture that needs unprepared scratch retains the original kernels.
+budget. A raw-input capture that needs unprepared scratch retains the original kernels.
 Prepared graph calls read fresh activation, routing and expert bytes on replay.
 Prompt ring slots are released only after all raw-weight readers finish.
 
 This first binding uses the shared SIMT reader with the explicit
 `columns=16, warps=4, split=1` recipe. It does not import llama.cpp's measured
-GEMV policy, TC dispatcher, JIT, persistent disk cache or automatic prefill
-selector. The recipe is a correctness baseline, not a measured speed choice.
+GEMV policy, TC dispatcher, JIT or automatic prefill selector. The recipe is a correctness baseline, not a measured speed choice.
 FP16 weight/activation arithmetic can differ from native integer-dot kernels;
 numerical and model A/B checks on the box are required before evaluating speed.
 
@@ -162,6 +161,90 @@ Dispatch reports distinguish `quactlize: resident K-pack GEMV`,
 `quactlize: mutable grouped experts, online shuffle + indexed GEMV` from
 scratch/capture fallback. A loaded library alone does not show that a model
 used it.
+
+## Prepare quactlize weights offline
+
+There are two different prepared directories:
+
+| Directory | Contents and use |
+| --- | --- |
+| `--pack /path/to/strata-pack` | Strata's model index, dense tensors and tokenizer, prepared by `tools/iq_pack.py`. This is also required by the original Strata engine. |
+| `STRATA_QUACTLIZE_PACK=/path/to/quactlize-pack` | Canonical K-pack weight planes, prepared once by `strata-ppu-pack`. Only the optional quactlize integration reads it. |
+
+Prepare both on the box. Reuse an existing Strata pack if it was prepared from
+these same GGUF shards. The quactlize producer runs on the PPU during preparation;
+the shared libraries are reused without changes. No llama.cpp path is required.
+Use the SDK's normal runtime environment and set the two quactlize library paths
+shown above before running the producer.
+
+```sh
+# Original Strata model preparation, once (omit if this pack already exists).
+python tools/iq_pack.py --gguf /path/to/model-00001-of-00002.gguf \
+  --out /path/to/strata-pack --compat-bf16
+
+# Add this target to the PPU build configured above.
+cmake --build build-ppu --target strata strata-ppu-pack quactlize_parity -j 3
+build-ppu/strata-ppu-pack \
+  --gguf /path/to/model-00001-of-00002.gguf \
+  --out /path/to/quactlize-pack
+
+# Check numerical parity on the box, then use the artifact for inference.
+build-ppu/quactlize_parity offline
+STRATA_QUACTLIZE=1 STRATA_QUACTLIZE_PACK=/path/to/quactlize-pack \
+  build-ppu/strata generate --gpu 0 \
+  --pack /path/to/strata-pack \
+  --native /path/to/model-00001-of-00002.gguf \
+  --tokens-file /path/to/prompt.ids \
+  --prefill 128 --max-context 4096 --max-new 32 --kv int8 --greedy --stats
+```
+
+`--gguf` discovers all shards. The output must be a new directory. Preparation
+writes a temporary sibling directory and publishes it only after the files are
+complete. It packs one tensor/expert at a time. `index.txt` records the descriptor,
+plane sizes, source identity and payload checksums; `weights.bin` holds the data.
+Keep the original GGUFs for CPU offload, unsupported matrices and token tables.
+The offline directory adds disk storage, roughly the size of its supported
+matrices and their raw expert down projections.
+
+Each converted GPU expert blob contains packed merged gate/up followed by the
+original down bytes. The blob size and down offset are unchanged, so residency
+slots keep their existing sizes. Startup fill, adaptive swaps, prompt loans,
+refill and Foresight prediction all load these bytes. CPU decode and CPU prompt
+sharing still use the original source. Eviction into a CPU RAM slot reloads
+raw bytes from that source rather than copying the packed GPU slot back.
+Ordinary PCIe miss staging stays raw and uses the original expert kernels.
+
+Offline prompt gate/up reads the packed planes and interleaves its output in
+place. Grouped decode gathers the already packed planes for the shared indexed
+reader; it does **no runtime shuffle**. This still adds gather and activation
+conversion work. Down remains on the original kernel or NCP/ACBLAS prompt path.
+Immutable dense/head copies load from disk within `STRATA_QUACTLIZE_CACHE_MIB`;
+a missing or over-budget dense record keeps the raw reader. The original dense
+GPU allocations remain for sliced and fused readers.
+
+The runtime adapter forbids invoking the producer in offline mode. A converted
+expert cannot fall back to a raw reader: insufficient scratch, unsupported graph
+capture or mismatched layout stops with an error. Increase
+`STRATA_QUACTLIZE_SCRATCH_MIB` if needed. Warm the same grouped operation before
+capture so its temporary storage exists. Producer/consumer descriptor and plane
+sizes must agree with the artifact. Both existing DSOs are still needed at
+runtime for admission; the producer's shuffle entry is used only by preparation.
+
+This mode currently requires `--native` and one visible GPU (`--gpu 0`); peer,
+remote and layer-split caches are rejected. Q8_0/Q2_K–Q6_K merged gate/up must
+satisfy the consumer geometry. IQ, Q2_0, scaled-down layouts and NVFP4 down remain
+raw. No quantization format is changed. The file identity check binds the artifact
+to the canonical GGUF paths, sizes, inode/device and modification timestamps.
+Moving/replacing a shard requires preparing again. Keep model and artifact files
+immutable during use. Per-record FNV-1a detects accidental corruption; it is not
+a cryptographic authentication scheme.
+
+For the three model A/B runs below, add
+`STRATA_QUACTLIZE_PACK=/path/to/quactlize-pack` to the environment. The two runs
+with quactlize disabled ignore it. Dispatch reports include
+`quactlize: offline expert GEMV` and
+`quactlize: offline grouped experts, no shuffle`. Confirm these counters before
+interpreting timings. Source compilation alone establishes no speedup.
 
 ## Controls and diagnostics
 
@@ -238,6 +321,7 @@ Loader tests require only a C++17 compiler and Python:
 ```sh
 python tests/ppu/test_loader.py --build-dir /workspace/strata-ppu-loader-tests
 python tests/ppu/test_quactlize_loader.py --build-dir /workspace/strata-quactlize-loader-tests
+python tests/ppu/test_offline_store.py --build-dir /workspace/strata-offline-store-tests
 ```
 
 They use ABI fixture libraries, not simulated model computations, to check
@@ -287,13 +371,16 @@ bash tools/ppu/check.sh -- \
   --prefill 128 --max-context 4096 --max-new 32 --kv int8 --greedy --stats
 ```
 
-This builds `quactlize_parity` and adds five strict checks: dense, grouped,
-graph, fallback and budget. The CPU oracle quantizes and dequantizes raw GGUF
+This builds `quactlize_parity` and `strata-ppu-pack` and adds six strict checks:
+dense, grouped, graph, fallback, budget and offline. The CPU oracle quantizes and dequantizes raw GGUF
 blocks through ggml, independently of the GPU producer. Tests include all six
 formats, strided inputs/outputs, beta, F16/F32/Q8_1 input, merged gate/up order,
 mutable expert replacement at the same address, two batches of routed groups,
 empty groups, destination scatter, cross-stream graph replay, the ready event,
-and calls that must decline without touching output. Missing hardware returns
+disk-loaded weights, prepacked expert replacement on graph replay, in-place
+prefill interleaving, and calls that must decline without touching output.
+The offline container tests cover corrupt/truncated files, missing experts,
+source identity and incompatible metadata without a GPU. Missing hardware returns
 77 and stops the box script; it is not a numerical pass.
 
 With model arguments, logs contain three runs: native (`NCP=0, quactlize=0`),

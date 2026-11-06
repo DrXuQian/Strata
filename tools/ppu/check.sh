@@ -30,7 +30,7 @@ if [[ "$with_quactlize" == 1 ]]; then
     for lib in "$QUACTLIZE_PPU_PACK_LIBRARY" "$QUACTLIZE_KPACK_EXECUTION/libquactlize_ppu_execution.so"; do
         if [[ ! -r "$lib" ]]; then printf 'Missing shared quactlize library: %s\n' "$lib" >&2; exit 1; fi
     done
-    targets+=(quactlize_parity)
+    targets+=(quactlize_parity strata-ppu-pack)
 fi
 if [[ ${1:-} == -- ]]; then shift; fi
 
@@ -86,8 +86,15 @@ for case_name in gdn-verify gdn-commit gdn-graph gdn-chunked moe fa fa-q8; do
         "$build/ncp_parity" "$case_name" 2>&1 | tee "$out/$case_name.log"
 done
 if [[ "$with_quactlize" == 1 ]]; then
-    sha256sum "$build/quactlize_parity" >> "$out/provenance.txt"
-    for case_name in dense grouped graph fallback budget; do
+    sha256sum "$build/quactlize_parity" "$build/strata-ppu-pack" >> "$out/provenance.txt"
+    if [[ -n ${STRATA_QUACTLIZE_PACK:-} ]]; then
+        printf 'offline_quactlize_pack: %s\n' "$STRATA_QUACTLIZE_PACK" >> "$out/provenance.txt"
+        sha256sum "$STRATA_QUACTLIZE_PACK/index.txt" >> "$out/provenance.txt"
+        # The manifest checks each loaded payload. Do not scan the entire model
+        # here: that would warm the filesystem cache before the first A/B run.
+        stat --printf='offline_weights_bytes=%s mtime=%y\n' "$STRATA_QUACTLIZE_PACK/weights.bin" >> "$out/provenance.txt"
+    fi
+    for case_name in dense grouped graph fallback budget offline; do
         "$build/quactlize_parity" "$case_name" 2>&1 | tee "$out/quactlize-$case_name.log"
     done
 fi

@@ -1,5 +1,9 @@
 // Physical-device, multi-kernel integration test. Not a simulator invocation.
 #include "strata/ppu/quactlize.hpp"
+#include "strata/ppu/offline.hpp"
+#include <filesystem>
+#include <fstream>
+#include <unistd.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include "ggml.h"
@@ -126,14 +130,31 @@ void dense_cases(cudaStream_t stream) {
     near(gy.get(want.size()),want,"interleaved merged gate/up");
 }
 
-void grouped_case(cudaStream_t stream, bool graph, bool down) {
+// Fixture preparation, outside the runtime adapter and graph capture. This
+// calls the same shared producer as strata-ppu-pack, then reads bytes to disk.
+std::vector<uint8_t> prepare(const Weight& w, int q, int n, int k, qz::Shape* shape = nullptr) {
+    qkg_call_v1 c{}; c.version=1; c.size=sizeof(c); c.qtype=q; c.n=n; c.k=k;
+    c.experts=c.rows=c.channels=c.topk=1; c.a_row_stride=k; c.out_row_stride=n;
+    qz::Shape desc;
+    require(qz::describe(c,desc), "offline fixture shape declined");
+    if (shape) *shape=desc;
+    Device<uint8_t> src(w.raw), packed(w.raw.size());
+    auto* high=desc.sizes.high_bytes ? packed.p+desc.sizes.low_bytes : nullptr;
+    require(!qz::library().pack(src.p,packed.p,high,packed.p+desc.sizes.low_bytes+desc.sizes.high_bytes,
+        n,k,1,q,&desc.arrangement,nullptr), "offline fixture producer failed");
+    return packed.get(w.raw.size());
+}
+
+void grouped_case(cudaStream_t stream, bool graph, bool down, bool packed = false) {
     const int n = down ? 256 : 1280, k = down ? 512 : 2560, q = down ? 14 : 12;
     constexpr int cap = 11, rows = 17; // two batches, padded entries, empty groups
     Weight w0(q,n,k,0), w1(q,n,k,1);
     const size_t offset = 256;
     std::vector<uint8_t> blob0(offset+w0.raw.size()), blob1(offset+w1.raw.size());
-    std::copy(w0.raw.begin(),w0.raw.end(),blob0.begin()+offset);
-    std::copy(w1.raw.begin(),w1.raw.end(),blob1.begin()+offset);
+    auto bytes0 = packed ? prepare(w0,q,n,k) : w0.raw;
+    auto bytes1 = packed ? prepare(w1,q,n,k) : w1.raw;
+    std::copy(bytes0.begin(),bytes0.end(),blob0.begin()+offset);
+    std::copy(bytes1.begin(),bytes1.end(),blob1.begin()+offset);
     Device<uint8_t> d0(blob0), d1(blob1);
     std::vector<unsigned long long> ptr(cap);
     for (int i = 0; i < cap; ++i) ptr[i] = (unsigned long long) (i%2 ? d1.p : d0.p);
@@ -146,7 +167,7 @@ void grouped_case(cudaStream_t stream, bool graph, bool down) {
     Device<float> out(size_t(rows)*n), up(size_t(rows)*n/2);
     auto submit = [&] {
         require(qz::grouped(dp.p,ds.p,dc.p,down ? nullptr : dt.p,down ? dd.p : nullptr,cap,rows,
-            dx.p,offset,q,n,k,out.p,down ? nullptr : up.p,stream), "grouped adapter declined");
+            dx.p,offset,q,n,k,out.p,down ? nullptr : up.p,stream,packed), "grouped adapter declined");
     };
     submit(); ck(cudaStreamSynchronize(stream));
     cudaGraph_t g = nullptr; cudaGraphExec_t exec = nullptr;
@@ -159,7 +180,8 @@ void grouped_case(cudaStream_t stream, bool graph, bool down) {
         if (trial == 1) {
             // Same pointer, new expert contents and routing on graph replay.
             w0 = Weight(q,n,k,7);
-            std::copy(w0.raw.begin(),w0.raw.end(),blob0.begin()+offset); d0.put(blob0);
+            bytes0 = packed ? prepare(w0,q,n,k) : w0.raw;
+            std::copy(bytes0.begin(),bytes0.end(),blob0.begin()+offset); d0.put(blob0);
             std::swap(ptr[0],ptr[9]); dp.put(ptr);
             count[0] = 9; dc.put(count);
             xq = activations(rows,k,x,5); dx.put(xq);
@@ -212,6 +234,72 @@ void resident_graph(cudaStream_t stream) {
     qz::release(dw.p);
 }
 
+void offline_case(cudaStream_t stream) {
+    namespace off = strata::ppu::offline;
+    namespace fs = std::filesystem;
+    char pattern[] = "/tmp/strata-quactlize-test-XXXXXX";
+    const char* directory = mkdtemp(pattern);
+    require(directory, "fixture directory");
+    const fs::path root(directory);
+    struct Cleanup { fs::path root; ~Cleanup() { std::error_code ec; fs::remove_all(root,ec); } } cleanup{root};
+    const std::string source=(root/"source.gguf").string();
+    { std::ofstream out(source); out << "source identity fixture"; }
+    std::ofstream index(root/"index.txt"), data(root/"weights.bin",std::ios::binary);
+    index << "strata.quactlize.pack 1\n"; off::write_source(index,off::identify(source));
+    uint64_t offset=0;
+    for (int q : {8,10,11,12,13,14}) {
+        Weight w(q,256,512,q); off::Record r;
+        r.name="dense."+std::to_string(q); r.type=q; r.n=256; r.k=512;
+        const auto bytes=prepare(w,q,r.n,r.k,&r.shape);
+        r.offset=offset; r.bytes=bytes.size(); r.hash=off::checksum(bytes.data(),bytes.size());
+        data.write(reinterpret_cast<const char*>(bytes.data()),bytes.size());
+        off::write_record(index,r); offset+=bytes.size();
+    }
+    index.close(); data.close(); require(index && data, "fixture files");
+    setenv("STRATA_QUACTLIZE_PACK",directory,1);
+    off::bind({source});
+    // Offline runtime must neither repack an absent tensor nor mutate raw GGUF.
+    constexpr int m=3,n=256,k=512;
+    std::vector<float> x(m*k);
+    for (size_t i=0;i<x.size();++i) x[i]=value(i,2);
+    Device<float> dx(x), dy(m*n);
+    for (int q : {8,10,11,12,13,14}) {
+        Weight w(q,n,k,q); Device<uint8_t> dw(w.raw);
+        const std::string name="dense."+std::to_string(q);
+        require(qz::preload(dw.p,q,n,k,"absent")==0,"missing offline dense was shuffled");
+        require(!qz::dense(dw.p,q,n,k,dx.p,qz::Input::f32,m,dy.p,stream),"raw offline dense was shuffled");
+        require(qz::preload(dw.p,q,n,k,name.c_str())==w.raw.size(),"offline dense preload declined");
+        require(qz::dense(dw.p,q,n,k,dx.p,qz::Input::f32,m,dy.p,stream),"offline dense declined");
+        ck(cudaStreamSynchronize(stream));
+        near(dy.get(m*n),product(x,w,m,n,k,k),"disk-loaded dense");
+        require(dw.get(w.raw.size())==w.raw,"offline preload changed raw GGUF");
+        qz::release(dw.p);
+    }
+    // Prefill: packed merged GU, in-place interleave, first-call capture, fresh
+    // activations on replay. The packed pointer needs no resident registration.
+    constexpr int gn=1280,gk=2560;
+    Weight w(12,gn,gk); Device<uint8_t> dw(prepare(w,12,gn,gk));
+    Device<__half> dh(m*gk); Device<float> gy(m*(gn+8));
+    cudaGraph_t graph; cudaGraphExec_t exec;
+    ck(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
+    require(qz::dense(dw.p,12,gn,gk,dh.p,qz::Input::f16,m,gy.p,stream,0,gn+8,0,true,true),"offline prefill capture");
+    ck(cudaStreamEndCapture(stream,&graph)); ck(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
+    for (int trial=0;trial<2;++trial) {
+        std::vector<float> xf(m*gk); std::vector<__half> xh(xf.size());
+        for (size_t i=0;i<xf.size();++i) xf[i]=__half2float(xh[i]=__float2half_rn(value(i,trial)));
+        dh.put(xh); std::vector<float> want(m*(gn+8),17); gy.put(want);
+        ck(cudaGraphLaunch(exec,stream)); ck(cudaStreamSynchronize(stream));
+        const auto ref=product(xf,w,m,gn,gk,gk);
+        for (int row=0;row<m;++row) for (int j=0;j<gn;++j)
+            want[row*(gn+8)+2*(j%(gn/2))+j/(gn/2)]=ref[row*gn+j];
+        near(gy.get(want.size()),want,"offline prefill interleave graph");
+    }
+    ck(cudaGraphExecDestroy(exec)); ck(cudaGraphDestroy(graph));
+    grouped_case(stream,true,false,true);
+    // All runtime adapter paths above run with offline enabled: its shuffle
+    // helper throws if called. Only explicit fixture preparation can pack.
+}
+
 void fallback_case(cudaStream_t stream, bool budget) {
     Weight w(12,256,512); Device<uint8_t> dw(w.raw);
     Device<float> dx(512), dy(std::vector<float>(256,17));
@@ -238,8 +326,9 @@ void fallback_case(cudaStream_t stream, bool budget) {
 }
 }
 int main(int argc, char** argv) {
-    if (argc != 2) { std::fprintf(stderr,"usage: quactlize_parity dense|grouped|graph|fallback|budget\n"); return 2; }
+    if (argc != 2) { std::fprintf(stderr,"usage: quactlize_parity dense|grouped|graph|fallback|budget|offline\n"); return 2; }
     const std::string mode = argv[1];
+    unsetenv("STRATA_QUACTLIZE_PACK"); // Fixtures never load a user model pack.
     setenv("STRATA_QUACTLIZE","1",1);
     if (mode == "budget") { setenv("STRATA_QUACTLIZE_CACHE_MIB","0",1); setenv("STRATA_QUACTLIZE_SCRATCH_MIB","0",1); }
     try {
@@ -248,6 +337,7 @@ int main(int argc, char** argv) {
         if (mode != "fallback") qz::library(); // The fallback fixture first checks a cold capture.
         cudaStream_t stream; ck(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
         if (mode == "dense") dense_cases(stream);
+        else if (mode == "offline") offline_case(stream);
         else if (mode == "grouped" || mode == "graph") {
             grouped_case(stream,mode=="graph",false); grouped_case(stream,mode=="graph",true);
             if (mode == "graph") resident_graph(stream);

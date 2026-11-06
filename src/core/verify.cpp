@@ -1,3 +1,6 @@
+#ifdef STRATA_QUACTLIZE
+#include "strata/ppu/offline.hpp"
+#endif
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 // HostGraphLaunch (the graph launched by the calling thread, or by a helper thread so this one can serve the doorbells): CUDA builds,
 // and the Windows HIP build (STRATA_VERIFY_ASYNC_LAUNCH=1 launches from a helper thread; STRATA_LAUNCH_PROBE=1 logs the launch timing).
@@ -2380,6 +2383,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 #else
                 (void) vram;
                 NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+#endif
+#ifdef STRATA_QUACTLIZE
+                L.quact_packed = vram && strata::ppu::offline::layer((int) l);
 #endif
                 if (f.had_d) { L.had_block = f.had_block; L.d_signs = had_sh_; }   // APR: h is rotated in there
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
