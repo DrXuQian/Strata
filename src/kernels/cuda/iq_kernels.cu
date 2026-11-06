@@ -1,3 +1,7 @@
+#ifdef STRATA_QUACTLIZE
+#include "strata/ppu/quactlize.hpp"
+#include <climits>
+#endif
 // src/kernels/cuda/iq_kernels.cu - see include/strata/kernels/iq_kernels.hpp.
 //
 // The dot products (vec_dot_*_q8_1), the dequantizers and the q8_1 quantizer are transcribed from llama.cpp
@@ -6282,6 +6286,35 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     float* h = (float*) ((uint8_t*) scratch + 2 * fa);
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
+#ifdef STRATA_QUACTLIZE
+    if (!L.gu_nib && !L.tail_off && L.d_type < 100 && g_exp_phase == 0 && cap_groups <= INT_MAX && cap_entries <= INT_MAX &&
+        L.n_embd <= INT_MAX && L.n_ff <= INT_MAX / 2 &&
+        strata::ppu::quactlize::grouped(grp_ptr, grp_start, n_groups, ent_tok, nullptr,
+            (int) cap_groups, (int) cap_entries, x_q8_1, 0, L.gu_type, (int) (2 * L.n_ff), (int) L.n_embd,
+            gate, up, stream)) {
+        const long long nh = (long long) cap_entries * L.n_ff;
+        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
+        if (L.had_block > 0) hadamard_rows(h, h, cap_entries, L.n_ff, L.had_block, L.d_signs, s);
+        quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
+        if (!strata::ppu::quactlize::grouped(grp_ptr, grp_start, n_groups, nullptr, ent_dst,
+                (int) cap_groups, (int) cap_entries, hq, L.down_off, L.d_type, (int) L.n_embd, (int) L.n_ff,
+                out, nullptr, stream)) {
+            // Qwen Flash-Next K=640 down often has no admitted K-pack reader.
+            // Keep its original raw-GGUF kernel and Q8_1 activation contract.
+            const int d_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_ff == 640)
+                ? (L.d_type == 20 || L.d_type == 40 ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
+            const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) cap_groups);
+            switch (L.d_type) {
+#define STRATA_QUACT_DOWN(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+                STRATA_D_FMTS(STRATA_QUACT_DOWN)
+#undef STRATA_QUACT_DOWN
+                default: std::fprintf(stderr, "quactlize: unsupported native down type %d\n", L.d_type); std::exit(1);
+            }
+        }
+        check("native_expert_grouped/quactlize");
+        return;
+    }
+#endif
 #if !STRATA_EXPERT_NIBBLE_BUILT
     if (L.gu_nib) {   // STRATA_EXPERT_NIBBLE's slots: the switch is refused at start in a build without the kernels
         std::fprintf(stderr, "native_expert_grouped: 4-bit gate/up slots are not built into this engine\n");

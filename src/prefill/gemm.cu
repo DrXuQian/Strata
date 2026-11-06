@@ -1,3 +1,7 @@
+#ifdef STRATA_QUACTLIZE
+#include "strata/ppu/quactlize.hpp"
+#include <climits>
+#endif
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
@@ -1352,6 +1356,11 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, float beta, int64_t ldx) {
+#ifdef STRATA_QUACTLIZE
+    if (T <= INT_MAX && N <= INT_MAX && K <= INT_MAX &&
+        strata::ppu::quactlize::dense(W_blocks, ggml_type, (int) N, (int) K, X,
+            strata::ppu::quactlize::Input::f16, (int) T, Y, stream_, ldx, ldy, beta)) return;
+#endif
 #ifdef STRATA_USE_HIP
     // S23 (opt-in STRATA_PF_PAD=1, with STRATA_PF_GEMM=1 on chunks of STRATA_PF_SWITCH_MIN_T+ tokens): the weight
     // dequantized into the scratch with row stride K + 64 halves, so no 4 KB-multiple stride camps on the memory

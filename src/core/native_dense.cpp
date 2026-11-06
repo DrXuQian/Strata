@@ -1,4 +1,7 @@
 #include "strata/core/native_dense.hpp"
+#ifdef STRATA_QUACTLIZE
+#include "strata/ppu/quactlize.hpp"
+#endif
 #include <cstdlib>
 #include "strata/core/weights.hpp"
 #include "strata/artifact/gguf_reader.hpp"
@@ -272,6 +275,9 @@ NativeDense::~NativeDense() {
                 if (b != nullptr && std::find(weights_.begin(), weights_.end(), b) != weights_.end()) b = nullptr;
     for (const void* p : packed_keys_) strata::kernels::native_q8_0_packed_unregister(p);
     if (scratch_) cudaFree(scratch_);
+#ifdef STRATA_QUACTLIZE
+    for (void* p : weights_) strata::ppu::quactlize::release(p);
+#endif
     for (void* p : weights_) cudaFree(p);
 }
 
@@ -531,6 +537,14 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 weights_.push_back(item.packed.release());
             }
             weights_.push_back(item.data.release());
+#ifdef STRATA_QUACTLIZE
+            // Immutable only: mutable expert and prompt staging addresses must
+            // never inherit a resident artifact from a previous occupant.
+            const size_t qp = strata::ppu::quactlize::preload(item.ref->native_data, item.type,
+                (int) item.ref->ne1, (int) item.ref->ne0);
+            total += qp;
+            allocated += alloc_bytes(qp);
+#endif
         }
         if (packed_count)
             std::fprintf(stderr, "native dense: STRATA_Q8_PACKED=1 packed %zu Q8_0 matrices for decode (+%.1f MiB)\n",
