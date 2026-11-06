@@ -203,7 +203,7 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
 /// threads that have not exited) and CTA 0 waits, reads its own slots, and writes the token.
 constexpr int kAmCtas = 8;      // CTAs per token (the portable cluster size)
 constexpr int kAmThreads = 1024;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && !defined(STRATA_USE_PPU)
 #define STRATA_AM_CLUSTER 1
 #else
 #define STRATA_AM_CLUSTER 0     // older targets: a trap, never launched (sample_greedy_cluster checks)
@@ -1209,7 +1209,7 @@ int2* split_scratch(void* stream, size_t entries) {
 }  // namespace
 
 bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* out, void* stream) {
-#if defined(__HIPCC__)
+#if defined(__HIPCC__) || defined(STRATA_USE_PPU)
     (void) logits; (void) n_tokens; (void) n_vocab; (void) out; (void) stream;
     return false;
 #else

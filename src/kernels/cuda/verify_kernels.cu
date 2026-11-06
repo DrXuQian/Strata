@@ -13,6 +13,9 @@
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/gfx_arch.hpp"   // #3264: the gfx12 test of the multi-block head ops
 #include "strata/kernels/pdl.hpp"
+#ifdef STRATA_NCP_GDN
+#include "strata/ppu/kernels.hpp"
+#endif
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -1294,6 +1297,21 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
     }
     const dim3 g1((unsigned) h_v), b1(S, RG);
     const bool all_out = n_keep == nullptr && t_out_begin <= 0;
+#ifdef STRATA_NCP_GDN
+    // Verification reads the carried state; only the later commit may update it.
+    // Device-selected n_keep and partial-output replays retain the existing kernels.
+    if (all_out && strata::ppu::gdn(state, nullptr, h, h + h_k * S, h + 2 * h_k * S,
+                                  conv_channels, conv_channels, conv_channels, gate, beta, y,
+                                  n_tok, h_k, h_v, S, 1.0f / std::sqrt(float(S)), false, stream, true)) {
+        const dim3 ng((unsigned) h_v, (unsigned) n_tok);
+        if (xq) gdn_out_norm_kernel<true><<<ng, dim3(S, RG), 0, (cudaStream_t) stream>>>(
+            z, gamma, eps, y, h_v, n_tok, nullptr, 0, xq);
+        else gdn_out_norm_kernel<false><<<ng, dim3(S, RG), 0, (cudaStream_t) stream>>>(
+            z, gamma, eps, y, h_v, n_tok, nullptr, 0, nullptr);
+        check("gdn_step_norm_multi (NCP)");
+        return;
+    }
+#endif
     if (xq && t_out_begin < n_tok) {
         if (all_out) gdn_step_norm_multi_kernel<true, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
             state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, nullptr, 0, xq);
@@ -1757,7 +1775,7 @@ bool& pdl_scope() {
 }
 
 bool pdl_supported() {
-#if defined(__HIPCC__) || !defined(CUDART_VERSION) || CUDART_VERSION < 12030
+#if defined(__HIPCC__) || defined(STRATA_USE_PPU) || !defined(CUDART_VERSION) || CUDART_VERSION < 12030
     return false;   // HIP; or a CUDA runtime without the capture-dependency query pdl_launch_ok needs
 #else
     // per device (a layer split runs on several): 1 = runs, 2 = does not.  sm_90+ (the card's, or STRATA_EMULATE_CC's),
@@ -1788,7 +1806,7 @@ bool pdl_supported() {
 #endif
 }
 
-#if !defined(__HIPCC__)
+#if !defined(__HIPCC__) && !defined(STRATA_USE_PPU)
 bool pdl_launch_ok(const void* kernel, cudaStream_t stream) {
 #if !defined(CUDART_VERSION) || CUDART_VERSION < 12030
     (void) kernel; (void) stream;

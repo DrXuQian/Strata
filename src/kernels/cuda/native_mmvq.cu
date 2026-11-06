@@ -684,9 +684,14 @@ __device__ __forceinline__ int ldg_nc_b2(const void* p, int i32) {   // load_int
 // P1: base + k * stride as one IMAD.WIDE.U32 (an asm so the front end does not share k * stride between pointers and
 // turn each into a 64-bit add pair)
 __device__ __forceinline__ const void* madw(const void* base, int k, int stride) {
+#ifdef STRATA_USE_PPU
+    // SDK 2.1.1 lowers a pointer-valued mad.wide operand to invalid LLVM IR.
+    return static_cast<const uint8_t*>(base) + uint64_t(uint32_t(k)) * uint32_t(stride);
+#else
     const void* r;
     asm("mad.wide.u32 %0, %1, %2, %3;" : "=l"(r) : "r"(k), "r"(stride), "l"(base));
     return r;
+#endif
 }
 // P2: (float) p for |p| < 2^22 as an add on the FMA pipe instead of the quarter-rate I2F: p + 1.5 * 2^23
 // as float bits is exactly 1.5 * 2^23 + p (unit ulp), and the subtraction is exact (Sterbenz), so the value is the

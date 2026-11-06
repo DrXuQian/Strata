@@ -10,6 +10,9 @@
 #include "strata/core/defaults_026.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
+#ifdef STRATA_NCP_GDN
+#include "strata/ppu/kernels.hpp"
+#endif
 #include "strata/core/window_evict.hpp"
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/pin_budget.hpp"
@@ -1232,6 +1235,16 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: stream create failed";
         return false;
     }
+#ifdef STRATA_NCP_GDN
+    try {
+        // The verifier normally captures without an eager forward pass.
+        (void) strata::ppu::prepare_gdn(strata::kernels::kVerifyLongT, int(g.ssm_v_heads),
+                                       int(g.ssm_state_size), cs_);
+    } catch (const std::exception& e) {
+        err = std::string("verify: NCP workspace: ") + e.what();
+        return false;
+    }
+#endif
     if (cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming) != cudaSuccess) {

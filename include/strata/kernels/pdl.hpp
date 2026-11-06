@@ -41,7 +41,7 @@ bool pdl_supported();
 // On CUDA the activation pointers lose __restrict__ so the compiler cannot load them before pdl_wait() - but only
 // where PDL can run (sm_70 and newer here).  On Pascal and older (__CUDA_ARCH__ < 700, no PDL) `__restrict__` is what
 // lets the compiler use the read-only data path (LDG.CI): without it decode on sm_61 halves (#1469).
-#if defined(__HIPCC__)
+#if defined(__HIPCC__) || defined(STRATA_USE_PPU)
 #define STRATA_PDL_RESTRICT __restrict__
 #elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
 #define STRATA_PDL_RESTRICT __restrict__
@@ -49,7 +49,7 @@ bool pdl_supported();
 #define STRATA_PDL_RESTRICT
 #endif
 
-#if defined(__HIPCC__)
+#if defined(__HIPCC__) || defined(STRATA_USE_PPU)
 inline constexpr bool kPdlPrefetch = false;   // HIP: no PDL, the kernels keep their plain loops
 #else
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
@@ -62,13 +62,13 @@ bool pdl_launch_ok(const void* kernel, cudaStream_t stream);
 #endif
 
 __device__ __forceinline__ void pdl_wait() {
-#if !defined(__HIPCC__) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if !defined(__HIPCC__) && !defined(STRATA_USE_PPU) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
 }
 
 __device__ __forceinline__ void pdl_trigger() {
-#if !defined(__HIPCC__) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if !defined(__HIPCC__) && !defined(STRATA_USE_PPU) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     asm volatile("griddepcontrol.launch_dependents;" :::);
 #endif
 }
@@ -78,7 +78,7 @@ __device__ __forceinline__ void pdl_trigger() {
 template <typename... KArgs, typename... Args>
 inline void launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t stream,
                        Args&&... args) {
-#if !defined(__HIPCC__)
+#if !defined(__HIPCC__) && !defined(STRATA_USE_PPU)
     // BW-MEASURE: inside the verify recorder with STRATA_DF_PDL on, the two notes below say whether a launch got the programmatic edge
     if (pdl_scope() && pdl_launch_ok((const void*) kernel, stream)) {
         strata::dispatch::note("pdl: launch with a programmatic edge");

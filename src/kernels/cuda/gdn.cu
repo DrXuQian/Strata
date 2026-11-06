@@ -3,6 +3,9 @@
 // See include/strata/kernels/gdn.hpp for the state layout (S, h_v, S) and for why the recurrence needs no
 // barrier at all: every line of it touches only one (j, h) column, so one thread owns a column end to end.
 #include "strata/kernels/gdn.hpp"
+#ifdef STRATA_NCP_GDN
+#include "strata/ppu/kernels.hpp"
+#endif
 
 #include <cuda_runtime.h>
 
@@ -158,6 +161,16 @@ void gdn_step(float* state, const float* q, const float* k, const float* v, cons
                      (long long) s.S);
         std::exit(1);
     }
+#ifdef STRATA_NCP_GDN
+    if (strata::ppu::gdn(state, state, q, k, v, s.h_k * s.S, s.h_k * s.S, s.h_v * s.S,
+                         gate, beta, o, 1, int(s.h_k), int(s.h_v), int(s.S), 1.0f, false, stream)) {
+        if (!stream) {
+            const cudaError_t e = cudaDeviceSynchronize();
+            if (e != cudaSuccess) { std::fprintf(stderr, "gdn_step: %s\n", cudaGetErrorString(e)); std::exit(1); }
+        }
+        return;
+    }
+#endif
     const dim3 grid((unsigned) ((s.S + JTHREADS - 1) / JTHREADS),
                     (unsigned) ((s.h_v + MAX_H - 1) / MAX_H));
     gdn_step_kernel<<<grid, JTHREADS, 0, (cudaStream_t) stream>>>(state, q, k, v, gate, beta, o, (int) s.S,

@@ -85,6 +85,7 @@ cmake --build build --target strata -j8
 
 Run against the resulting binary and the matching model config. Use the build instructions for
 [HIP](AMD_HIP.md), [SYCL](INTEL_ARC.md) or [Metal](MAC.md) when changing those backends.
+The opt-in [PPU source build](PPU.md) uses a CUDA-compatible PPU SDK and external NCP libraries for Qwen3.8-Flash-Next.
 Follow [contribution validation requirements](../CONTRIBUTING.md) before requesting review.
 
 For the Terminal monitor from a checkout:
