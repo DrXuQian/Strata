@@ -1,5 +1,5 @@
 #include "strata/ppu/kernels.hpp"
-#include "strata/ppu/ncp.hpp"
+#include "strata/ppu/python.hpp"
 #include "strata/core/dispatch_stats.hpp"
 
 #include <cuda_runtime.h>
@@ -21,15 +21,13 @@ namespace {
 void check(cudaError_t error) {
     if (error != cudaSuccess) throw std::runtime_error(std::string("strata PPU: ") + cudaGetErrorString(error));
 }
-bool accepted(int rc, const char* name, bool any_nonzero_declines = false) {
-    if (rc == 0) return true;
-    if (rc == -1 || any_nonzero_declines) {
-        check(cudaGetLastError());
-        strata::dispatch::note("ppu: NCP declined, using Strata kernels");
-        return false;
-    }
-    throw std::runtime_error(std::string("strata PPU: ") + name + " failed, status " + std::to_string(rc));
+int device() { int d;check(cudaGetDevice(&d));return d; }
+bool capturing(cudaStream_t stream) {
+    cudaStreamCaptureStatus status;check(cudaStreamIsCapturing(stream,&status));
+    return status!=cudaStreamCaptureStatusNone;
 }
+using python::Dtype;
+using python::Tensor;
 
 size_t aligned(size_t bytes) { return (bytes + 255) & ~size_t(255); }
 
@@ -78,47 +76,48 @@ struct Arena {
 };
 
 template<class T> __device__ T convert(float x);
-template<> __device__ float convert<float>(float x) { return x; }
 template<> __device__ __nv_bfloat16 convert<__nv_bfloat16>(float x) { return __float2bfloat16_rn(x); }
 
 template<class T>
 __global__ void pack_gdn(const float* q, const float* k, const float* v, T* qo, T* ko, T* vo,
-                         const float* gate, const float* beta, float* gp, float* bp,
-                         int64_t qs, int64_t ks, int64_t vs, int H, int HV, int S, int Tn) {
+                         const float* gate, const float* beta, float* gp, __nv_bfloat16* bp,
+                         int64_t qs, int64_t ks, int64_t vs, int H, int HV, int S, int Tn, const int32_t* keep, int first) {
     const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= int64_t(Tn) * HV * S) return;
     const int d = i % S, h = (i / S) % HV, t = i / (HV * S);
+    const bool valid=!keep || t+first < max(*keep,0);
     if (h < H) {
         const int64_t qki = (int64_t(t) * H + h) * S + d;
-        qo[qki] = convert<T>(q[int64_t(t) * qs + h * S + d]);
-        ko[qki] = convert<T>(k[int64_t(t) * ks + h * S + d]);
+        qo[qki] = convert<T>(valid ? q[int64_t(t) * qs + h * S + d] : 0.f);
+        ko[qki] = convert<T>(valid ? k[int64_t(t) * ks + h * S + d] : 0.f);
     }
     // FLA pairs h / (HV/H), Strata pairs hv % H. Permute value heads so the
     // shared library can use its original (H,HV,S) specialization unchanged.
     const int hv = (h % (HV / H)) * H + h / (HV / H);
-    vo[i] = convert<T>(v[int64_t(t) * vs + hv * S + d]);
+    vo[i] = convert<T>(valid ? v[int64_t(t) * vs + hv * S + d] : 0.f);
     if (d == 0) {
-        gp[t * HV + h] = gate[t * HV + hv];
-        bp[t * HV + h] = beta[t * HV + hv];
+        gp[t * HV + h] = valid ? gate[t * HV + hv] : 0.f;
+        bp[t * HV + h] = __float2bfloat16_rn(valid ? beta[t * HV + hv] : 0.f);
     }
 }
 
 template<bool Pack>
-__global__ void state_layout(const float* in, float* out, int H, int HV, int S, bool chunked) {
+__global__ void state_layout(const float* in, float* out, int H, int HV, int S, const int32_t* keep = nullptr) {
     const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= int64_t(HV) * S * S) return;
+    if (i >= int64_t(HV) * S * S || (!Pack && keep && *keep<=0)) return;
     const int v = i % S, h = (i / S) % HV, k = i / (S * HV);
     const int he = (h % H) * (HV / H) + h / H;
-    const int64_t external = (int64_t(he) * S + (chunked ? k : v)) * S + (chunked ? v : k);
+    const int64_t external = (int64_t(he) * S + k) * S + v;
     if (Pack) out[external] = in[i];
     else out[i] = in[external];
 }
 
 template<class T>
-__global__ void unpack_gdn(const T* in, float* out, int64_t n, int H, int HV, int S) {
+__global__ void unpack_gdn(const T* in, float* out, int64_t n, int H, int HV, int S, const int32_t* keep = nullptr, int first = 0) {
     const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const int d = i % S, h = (i / S) % HV, t = i / (HV * S);
+    if (keep && t+first>=max(*keep,0)) return;
     const int he = (h % H) * (HV / H) + h / H;
     out[i] = float(in[(int64_t(t) * HV + he) * S + d]);
 }
@@ -177,94 +176,90 @@ __global__ void gather_qsa(kernels::QsaAttnPools p, const int32_t* ids, __half* 
 }
 }  // namespace
 
-bool prepare_gdn(int max_tokens, int HV, int S, void* stream) {
-    if (!ncp().recurrent || max_tokens <= 0 || HV <= 0 || HV > 65535 || S != 128) return false;
-    const size_t count = size_t(std::min(max_tokens, 256)) * HV * S;
-    const size_t states = size_t(HV) * S * S;
-    const auto cs = static_cast<cudaStream_t>(stream);
-    Scratch& scratch = scratch_for(cs, 0);
+namespace {
+constexpr int kGdnBlock=256;
+size_t gdn_bytes(int HV,int S) {
+    const size_t count=size_t(kGdnBlock)*HV*S,states=size_t(HV)*S*S;
+    return 2*aligned(states*4)+4*aligned(count*2)+aligned(count/S*4)+aligned(count/S*2);
+}
+struct GdnBuffers {
+    float *h0,*ht,*g;
+    __nv_bfloat16 *q,*k,*v,*o,*b;
+    explicit GdnBuffers(void* p,int HV,int S) {
+        Arena a{static_cast<char*>(p)};
+        const size_t count=size_t(kGdnBlock)*HV*S,states=size_t(HV)*S*S;
+        h0=a.take<float>(states);ht=a.take<float>(states);
+        q=a.take<__nv_bfloat16>(count);k=a.take<__nv_bfloat16>(count);
+        v=a.take<__nv_bfloat16>(count);o=a.take<__nv_bfloat16>(count);
+        g=a.take<float>(count/S);b=a.take<__nv_bfloat16>(count/S);
+    }
+    std::vector<Tensor> tensors(int T,int H,int HV,int S) {
+        return {{q,Dtype::bf16,{1,T,H,S}},{k,Dtype::bf16,{1,T,H,S}},
+            {v,Dtype::bf16,{1,T,HV,S}},{g,Dtype::f32,{1,T,HV}},{b,Dtype::bf16,{1,T,HV}},
+            {h0,Dtype::f32,{1,HV,S,S}},{o,Dtype::bf16,{1,T,HV,S}},{ht,Dtype::f32,{1,HV,S,S}}};
+    }
+};
+}
+bool prepare_gdn(int max_tokens,int H,int HV,int S,void* stream) {
+#ifndef STRATA_PPU_GDN
+    return false;
+#else
+    if(!enabled("STRATA_PPU_GDN")||max_tokens<=0||H<=0||HV<=0||HV>65535||HV%H||S!=128)return false;
+    const auto cs=static_cast<cudaStream_t>(stream);
+    if(capturing(cs))throw std::runtime_error("prepare_gdn must precede graph capture");
+    auto& scratch=scratch_for(cs,0);
     std::lock_guard<std::mutex> lock(scratch.mutex);
-    return scratch.reserve(2 * aligned(states * sizeof(float)) + 4 * aligned(count * sizeof(float)) +
-                           2 * aligned(count / S * sizeof(float)), cs);
+    if(!scratch.reserve(gdn_bytes(HV,S),cs))throw std::runtime_error("actlizeLA: insufficient prepared GDN scratch");
+    check(cudaMemsetAsync(scratch.data,0,scratch.bytes,cs));
+    GdnBuffers b(scratch.data,HV,S);
+    python::call("gdn_prepare",b.tensors(kGdnBlock,H,HV,S),{std::min(max_tokens,kGdnBlock)},device(),stream);
+    return true;
+#endif
 }
 
-bool gdn(const float* state, float* final_state, const float* q, const float* k, const float* v,
-         int64_t qs, int64_t ks, int64_t vs, const float* gate, const float* beta, float* out,
-         int T, int H, int HV, int S, float scale, bool allow_chunked, void* stream, bool allow_capture) {
-    const Ncp& api = ncp();
-    const bool chunked = allow_chunked && T >= 128 && T % 64 == 0 && api.chunked &&
-                         enabled("STRATA_NCP_GDN_CHUNKED");
-    if ((!chunked && !api.recurrent) || !state || !q || !k || !v || !gate || !beta || !out ||
-        T <= 0 || H <= 0 || HV <= 0 || HV > 65535 || HV % H || S != 128 ||
-        qs < int64_t(H) * S || ks < int64_t(H) * S || vs < int64_t(HV) * S) return false;
-    const auto cs = static_cast<cudaStream_t>(stream);
-    if (!allow_capture) {
-        cudaStreamCaptureStatus capture;
-        check(cudaStreamIsCapturing(cs, &capture));
-        if (capture != cudaStreamCaptureStatusNone) return false;
-    }
-    const int block_t = std::min(T, 256);
-    const size_t count = size_t(block_t) * HV * S, states = size_t(HV) * S * S;
-    size_t ws_bytes = 0;
-    if (chunked) {
-        for (int t = 128; t <= 256; t += 64)
-            ws_bytes = std::max(ws_bytes, api.workspace_size(1, t, H, HV, S));
-        if (!ws_bytes) return false;
-    }
-    const size_t element = chunked ? sizeof(__nv_bfloat16) : sizeof(float);
-    const size_t bytes = 2 * aligned(states * sizeof(float)) + 4 * aligned(count * element) +
-                         2 * aligned(count / S * sizeof(float)) + aligned(ws_bytes);
-    Scratch& scratch = scratch_for(cs, 0);
+bool gdn(const float* state,float* final_state,const float* q,const float* k,const float* v,
+         int64_t qs,int64_t ks,int64_t vs,const float* gate,const float* beta,float* out,
+         int T,int H,int HV,int S,float scale,bool allow_chunked,void* stream,bool allow_capture,
+         const int32_t* keep,int out_begin) {
+#ifndef STRATA_PPU_GDN
+    return false;
+#else
+    (void)allow_chunked; // The installed core owns full-chunk versus tail selection.
+    if(!enabled("STRATA_PPU_GDN")||!state||!q||!k||!v||!gate||!beta||(!out&&!final_state)||
+        T<=0||H<=0||HV<=0||HV>65535||HV%H||S!=128||
+        qs<int64_t(H)*S||ks<int64_t(H)*S||vs<int64_t(HV)*S)return false;
+    if(std::abs(scale-1.f/std::sqrt(float(S)))>1.e-7f)
+        throw std::invalid_argument("actlizeLA applies exactly one 1/sqrt(128) query scale");
+    const auto cs=static_cast<cudaStream_t>(stream);
+    const bool capture=capturing(cs);
+    if(capture&&!allow_capture)return false;
+    auto& scratch=scratch_for(cs,0);
     std::lock_guard<std::mutex> lock(scratch.mutex);
-    if (!scratch.reserve(bytes, cs)) return false;
-    Arena arena{static_cast<char*>(scratch.data)};
-    float* h0 = arena.take<float>(states);
-    float* ht = arena.take<float>(states);
-    void* qp = arena.take<char>(count * element);
-    void* kp = arena.take<char>(count * element);
-    void* vp = arena.take<char>(count * element);
-    void* op = arena.take<char>(count * element);
-    float* gp = arena.take<float>(count / S);
-    float* bp = arena.take<float>(count / S);
-    void* ws = arena.take<char>(ws_bytes);
-    state_layout<true><<<(states + 255) / 256, 256, 0, cs>>>(state, h0, H, HV, S, chunked);
-    for (int first = 0; first < T;) {
-        int nt = std::min(T - first, 256);
-        if (chunked && T - first > nt && T - first - nt < 128) nt -= 64;
-        const int64_t n = int64_t(nt) * HV * S;
-        int rc;
-        if (chunked) {
-            auto* qb = static_cast<__nv_bfloat16*>(qp);
-            auto* kb = static_cast<__nv_bfloat16*>(kp);
-            auto* vb = static_cast<__nv_bfloat16*>(vp);
-            auto* ob = static_cast<__nv_bfloat16*>(op);
-            pack_gdn<<<(n + 255) / 256, 256, 0, cs>>>(q + first * qs, k + first * ks, v + first * vs,
-                qb, kb, vb, gate + size_t(first) * HV, beta + size_t(first) * HV, gp, bp,
-                qs, ks, vs, H, HV, S, nt);
-            check(cudaGetLastError());
-            rc = api.chunked(qb, kb, vb, gp, bp, h0, ob, ht, 1, nt, H, HV, S, scale, ws, ws_bytes, stream);
-            if (!accepted(rc, "ncp_gdn_chunked_bf16")) return false;
-            unpack_gdn<<<(n + 255) / 256, 256, 0, cs>>>(ob, out + size_t(first) * HV * S, n, H, HV, S);
-        } else {
-            auto* qf = static_cast<float*>(qp);
-            auto* kf = static_cast<float*>(kp);
-            auto* vf = static_cast<float*>(vp);
-            auto* of = static_cast<float*>(op);
-            pack_gdn<<<(n + 255) / 256, 256, 0, cs>>>(q + first * qs, k + first * ks, v + first * vs,
-                qf, kf, vf, gate + size_t(first) * HV, beta + size_t(first) * HV, gp, bp,
-                qs, ks, vs, H, HV, S, nt);
-            check(cudaGetLastError());
-            rc = api.recurrent(qf, kf, vf, gp, bp, h0, of, ht, 1, nt, H, HV, S, scale, stream);
-            if (!accepted(rc, "ncp_gdn_recurrent")) return false;
-            unpack_gdn<<<(n + 255) / 256, 256, 0, cs>>>(of, out + size_t(first) * HV * S, n, H, HV, S);
+    if(!scratch.reserve(gdn_bytes(HV,S),cs))throw std::runtime_error("actlizeLA: insufficient prepared GDN scratch");
+    GdnBuffers b(scratch.data,HV,S);
+    const size_t states=size_t(HV)*S*S;
+    state_layout<true><<<(states+255)/256,256,0,cs>>>(state,b.h0,H,HV,S);
+    for(int first=0;first<T;first+=kGdnBlock) {
+        const int nt=std::min(T-first,kGdnBlock);
+        const int64_t n=int64_t(nt)*HV*S;
+        pack_gdn<<<(n+255)/256,256,0,cs>>>(q+first*qs,k+first*ks,v+first*vs,
+            b.q,b.k,b.v,gate+size_t(first)*HV,beta+size_t(first)*HV,b.g,b.b,
+            qs,ks,vs,H,HV,S,nt,keep,first);
+        check(cudaGetLastError());
+        python::call("gdn",b.tensors(nt,H,HV,S),{},device(),stream,capture);
+        const int skip=std::max(0,out_begin-first);
+        if(out&&skip<nt) {
+            const int64_t remaining=int64_t(nt-skip)*HV*S;
+            unpack_gdn<<<(remaining+255)/256,256,0,cs>>>(b.o+size_t(skip)*HV*S,
+                out+size_t(first+skip)*HV*S,remaining,H,HV,S,keep,first+skip);
         }
-        std::swap(h0, ht);
-        first += nt;
+        std::swap(b.h0,b.ht);
     }
-    if (final_state) state_layout<false><<<(states + 255) / 256, 256, 0, cs>>>(h0, final_state, H, HV, S, chunked);
+    if(final_state)state_layout<false><<<(states+255)/256,256,0,cs>>>(b.h0,final_state,H,HV,S,keep);
     check(cudaGetLastError());
-    strata::dispatch::note(chunked ? "ppu: NCP GDN chunked" : "ppu: NCP GDN recurrent");
+    strata::dispatch::note("ppu: actlizeLA Tensor GDN");
     return true;
+#endif
 }
 
 void gdn_norm(float* output, const float* z, const float* gamma, float eps, int HV, void* stream) {
@@ -274,8 +269,7 @@ void gdn_norm(float* output, const float* z, const float* gamma, float eps, int 
 
 bool expert_f16(const uint16_t* x, const uint16_t* weight, float* out,
                 int64_t rows, int64_t N, int64_t K, void* stream) {
-    const auto fn = ncp().moe;
-    if (!fn || !x || !weight || !out || rows <= 0 || rows > INT_MAX ||
+    if (!enabled("STRATA_PPU_MOE") || !x || !weight || !out || rows <= 0 || rows > INT_MAX ||
         N <= 0 || N > INT_MAX || K <= 0 || K > INT_MAX || N % 8 || K % 8) return false;
     const auto cs = static_cast<cudaStream_t>(stream);
     const int block_t = int(std::min<int64_t>(rows, 256));
@@ -297,19 +291,20 @@ bool expert_f16(const uint16_t* x, const uint16_t* weight, float* out,
         f16_to_bf16<<<(nt * K + 255) / 256, 256, 0, cs>>>(x + first * K, a, nt * K);
         one_expert<<<(nt + 255) / 256, 256, 0, cs>>>(ids, counts, nt);
         check(cudaGetLastError());
-        if (!accepted(fn(a, w, y, ids, counts, nt, int(N), int(K), 1, nt, stream), "ncp_moe_nopad", true)) return false;
+        python::call("moe",{{a,Dtype::bf16,{nt,K}},{w,Dtype::bf16,{1,N,K}},
+            {y,Dtype::bf16,{nt,N}},{ids,Dtype::i32,{nt}},{counts,Dtype::i32,{1}}},
+            {},device(),stream,capturing(cs));
         widen<<<(nt * N + 255) / 256, 256, 0, cs>>>(y, out + first * N, nt * N);
     }
     check(cudaGetLastError());
-    strata::dispatch::note("ppu: NCP NoPad expert GEMM");
+    strata::dispatch::note("ppu: DeepGEMM Tensor expert GEMM");
     return true;
 }
 
 bool qsa_prefill(const float* q, const kernels::QsaAttnPools& pools, const int32_t* ids,
                  const int32_t* host_steps, int64_t cap, const kernels::QsaShapes& s,
                  float* out, int64_t T, void* stream) {
-    const auto fn = ncp().fa;
-    if (!fn || !q || !ids || !host_steps || !out || !pools.page_table || T <= 0 || T > INT_MAX ||
+    if (!enabled("STRATA_PPU_FA") || !q || !ids || !host_steps || !out || !pools.page_table || T <= 0 || T > INT_MAX ||
         cap <= 0 || cap > INT_MAX || s.head_dim != 256 || s.n_head != 24 || s.n_head_kv != 2 ||
         s.page_size <= 0 || s.page_size > INT_MAX || pools.k_q4 || pools.v_q4) return false;
     if (pools.k_pool ? !pools.v_pool : (!pools.k_q || !pools.v_q || !pools.k_scale || !pools.v_scale)) return false;
@@ -341,14 +336,13 @@ bool qsa_prefill(const float* q, const kernels::QsaAttnPools& pools, const int32
         gather_qsa<<<(n + 255) / 256, 256, 0, cs>>>(pools, ids + t * cap, kh, vh,
             width, int(s.n_head_kv), int(s.head_dim), int(s.page_size));
         check(cudaGetLastError());
-        const int rc = fn(qh, kh, vh, oh, 1, 1, width, int(s.n_head), int(s.n_head_kv), 256, 256,
-            nq, 256, nq, n, 256, kv_row, n, 256, kv_row, nq, 256, nq,
-            1.0f / std::sqrt(256.0f), 0.0f, 0, -1, -1, 0, stream);
-        if (!accepted(rc, "ncp_flash_attn_fwd_v3", true)) return false;
+        python::call("fa",{{qh,Dtype::f16,{1,1,s.n_head,256}},
+            {kh,Dtype::f16,{1,width,s.n_head_kv,256}},{vh,Dtype::f16,{1,width,s.n_head_kv,256}},
+            {oh,Dtype::f16,{1,1,s.n_head,256}}},{},device(),stream);
         widen<<<(nq + 255) / 256, 256, 0, cs>>>(oh, out + t * nq, nq);
     }
     check(cudaGetLastError());
-    strata::dispatch::note("ppu: NCP selected-cell FlashAttention");
+    strata::dispatch::note("ppu: FlashAttention Tensor selected cells");
     return true;
 }
 

@@ -1,6 +1,6 @@
 // src/kernels/cuda/fused_gdn.cu - see include/strata/kernels/fused_gdn.hpp.
 #include "strata/kernels/fused_gdn.hpp"
-#ifdef STRATA_NCP_GDN
+#ifdef STRATA_PPU_GDN
 #include "strata/ppu/kernels.hpp"
 #include <cmath>
 #endif
@@ -165,7 +165,7 @@ void step_norm(float* state, const float* q, const float* k, const float* v, con
         std::fprintf(stderr, "fused_gdn_step_norm: invalid arguments\n");
         std::exit(1);
     }
-#ifdef STRATA_NCP_GDN
+#ifdef STRATA_PPU_GDN
     if constexpr (!SILU) {
         if (strata::ppu::gdn(state, state, q, k, v, h_k * S, h_k * S, h_v * S, gate, beta, y,
                              1, h_k, h_v, S, 1.0f / std::sqrt(float(S)), false, stream)) {

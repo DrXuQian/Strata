@@ -5,18 +5,21 @@
 
 namespace strata::ppu {
 
-// Reserve recurrence scratch before graph capture; no kernels or state updates.
-bool prepare_gdn(int max_tokens, int HV, int S, void* stream);
+// Prepare package/workspace and warm kernels on scratch before graph capture.
+// No model state is read or updated.
+bool prepare_gdn(int max_tokens, int H, int HV, int S, void* stream);
 
 // Strata state [K,HV,V]; q/k/v have independent token strides, in floats.
 // final_state == nullptr leaves the input state unchanged (speculative verification).
 // A false result leaves state untouched; callers must overwrite the entire output.
 // allow_capture requires prepared scratch and replay on the original stream.
 // Keep it false for session graphs captured on temporary streams.
+// keep is a device acceptance count; out_begin preserves earlier output rows.
 bool gdn(const float* state, float* final_state, const float* q, const float* k, const float* v,
          int64_t q_stride, int64_t k_stride, int64_t v_stride,
          const float* gate, const float* beta, float* out, int T, int H, int HV, int S,
-         float scale, bool allow_chunked, void* stream, bool allow_capture = false);
+         float scale, bool allow_chunked, void* stream, bool allow_capture = false,
+         const int32_t* keep = nullptr, int out_begin = 0);
 
 void gdn_norm(float* output, const float* z, const float* gamma, float eps, int HV, void* stream);
 
@@ -27,7 +30,7 @@ bool qsa_prefill(const float* q, const kernels::QsaAttnPools& pools, const int32
                  const int32_t* host_steps, int64_t cap, const kernels::QsaShapes& shape,
                  float* out, int64_t T, void* stream);
 
-// One expert's contiguous row segment through the real NoPad ABI (n_experts=1).
+// One expert's contiguous row segment through the installed NoPad Tensor entry (n_experts=1).
 // FP16 -> BF16 operands and BF16 -> FP32 output are explicit rounding boundaries.
 bool expert_f16(const uint16_t* x, const uint16_t* weight, float* out,
                 int64_t rows, int64_t N, int64_t K, void* stream);

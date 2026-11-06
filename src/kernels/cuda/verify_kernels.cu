@@ -13,8 +13,9 @@
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/gfx_arch.hpp"   // #3264: the gfx12 test of the multi-block head ops
 #include "strata/kernels/pdl.hpp"
-#ifdef STRATA_NCP_GDN
+#ifdef STRATA_PPU_GDN
 #include "strata/ppu/kernels.hpp"
+#include "strata/ppu/python.hpp"
 #endif
 
 #include <cuda_fp16.h>
@@ -1163,6 +1164,10 @@ void gdn_conv_commit(float* history, const float* qkv, int channels, const int32
 bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, const float* qkv, int64_t qkv_stride,
                        const float* h, int64_t h_stride, const float* gate, const float* beta, int64_t gb_stride,
                        int conv_channels, int h_k, int h_v, int n_max, int n_layers, const int32_t* n_keep, void* stream) {
+#ifdef STRATA_PPU_GDN
+    // The accepted prefix must use the same BF16 operands/core as verification.
+    if (strata::ppu::enabled("STRATA_PPU_GDN")) return false;
+#endif
     // the per-layer commit's kernel choice (gdn_step_norm_multi below): only its state-only kernel is batched here
     static const bool per_layer = [] {
         const char* sp = std::getenv("STRATA_GDN_SPLIT");
@@ -1237,6 +1242,17 @@ void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_chan
             std::fprintf(stderr, "gdn_step_norm_groups: invalid group %d\n", i);
             std::exit(1);
         }
+#ifdef STRATA_PPU_GDN
+    if (strata::ppu::enabled("STRATA_PPU_GDN")) {
+        for (int i=0;i<groups.n;++i) {
+            const int t=groups.first[i], nt=groups.ntok[i];
+            gdn_step_norm_multi(groups.state[i],h+int64_t(t)*conv_channels,conv_channels,
+                gate+int64_t(t)*h_v,beta+int64_t(t)*h_v,z+int64_t(t)*h_v*S,gamma,eps,
+                y+int64_t(t)*h_v*S,h_k,h_v,nt,commit?groups.keep[i]:nullptr,stream,0);
+        }
+        return;
+    }
+#endif
     const dim3 g1((unsigned) h_v, (unsigned) groups.n), b1(S, RG);
     // the kernel gdn_step_norm_multi picks for these calls: a window's rows (all outputs, no keep) or a commit of
     // one-row groups (keep, t_out_begin 0)
@@ -1261,6 +1277,25 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         std::fprintf(stderr, "gdn_step_norm_multi: invalid arguments\n");
         std::exit(1);
     }
+#ifdef STRATA_PPU_GDN
+    // Mask the rejected suffix on the device. A zero-length commit leaves the
+    // carried FP32 state untouched. Partial-output replay uses the same core.
+    const int ppu_out_begin = std::max(0, t_out_begin);
+    if (strata::ppu::gdn(state,n_keep?state:nullptr,h,h+h_k*S,h+2*h_k*S,
+            conv_channels,conv_channels,conv_channels,gate,beta,
+            ppu_out_begin<n_tok?y:nullptr,n_tok,h_k,h_v,S,1.f/std::sqrt(float(S)),false,
+            stream,true,n_keep,ppu_out_begin)) {
+        if(ppu_out_begin<n_tok) {
+            const dim3 ng((unsigned)h_v,(unsigned)(n_tok-ppu_out_begin));
+            if(xq)gdn_out_norm_kernel<true><<<ng,dim3(S,RG),0,(cudaStream_t)stream>>>(
+                z,gamma,eps,y,h_v,n_tok,n_keep,ppu_out_begin,xq);
+            else gdn_out_norm_kernel<false><<<ng,dim3(S,RG),0,(cudaStream_t)stream>>>(
+                z,gamma,eps,y,h_v,n_tok,n_keep,ppu_out_begin,nullptr);
+        }
+        check("gdn_step_norm_multi (actlizeLA)");
+        return;
+    }
+#endif
     // S26: the split runs where it is faster (gfx1151 harness, h_v 48: the commit 8-19% per call; a window of 2+ rows
     // 3-13%; one row: no gain, the old kernel stays) - bitwise equal in every case
     if (split && (t_out_begin >= n_tok || n_tok - t_out_begin >= 2)) {
@@ -1297,21 +1332,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
     }
     const dim3 g1((unsigned) h_v), b1(S, RG);
     const bool all_out = n_keep == nullptr && t_out_begin <= 0;
-#ifdef STRATA_NCP_GDN
-    // Verification reads the carried state; only the later commit may update it.
-    // Device-selected n_keep and partial-output replays retain the existing kernels.
-    if (all_out && strata::ppu::gdn(state, nullptr, h, h + h_k * S, h + 2 * h_k * S,
-                                  conv_channels, conv_channels, conv_channels, gate, beta, y,
-                                  n_tok, h_k, h_v, S, 1.0f / std::sqrt(float(S)), false, stream, true)) {
-        const dim3 ng((unsigned) h_v, (unsigned) n_tok);
-        if (xq) gdn_out_norm_kernel<true><<<ng, dim3(S, RG), 0, (cudaStream_t) stream>>>(
-            z, gamma, eps, y, h_v, n_tok, nullptr, 0, xq);
-        else gdn_out_norm_kernel<false><<<ng, dim3(S, RG), 0, (cudaStream_t) stream>>>(
-            z, gamma, eps, y, h_v, n_tok, nullptr, 0, nullptr);
-        check("gdn_step_norm_multi (NCP)");
-        return;
-    }
-#endif
+
     if (xq && t_out_begin < n_tok) {
         if (all_out) gdn_step_norm_multi_kernel<true, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
             state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, nullptr, 0, xq);
