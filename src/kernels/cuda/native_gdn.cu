@@ -24,6 +24,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "strata/kernels/native_gdn.hpp"
+#ifdef STRATA_NCP_GDN
+#include "strata/ppu/kernels.hpp"
+#endif
 #include "strata/core/geometry.hpp"
 #include <cuda_runtime.h>
 #include <atomic>
@@ -116,6 +119,10 @@ void native_gdn_step(float* state, const float* q, const float* k, const float* 
             throw std::invalid_argument("native GDN requires aligned input spans disjoint from state and output");
     }
     const float scale = 1.0f / sqrtf(float(S));
+#ifdef STRATA_NCP_GDN
+    if (strata::ppu::gdn(state, state, q, k, v, shape.h_k * S, shape.h_k * S, shape.h_v * S,
+                         gate, beta, output, 1, int(shape.h_k), int(shape.h_v), S, scale, false, stream)) return;
+#endif
     step<<<dim3(unsigned(shape.h_v), 1, S / 4), dim3(32, 4), 0, static_cast<cudaStream_t>(stream)>>>(
         state, q, k, v, gate, beta, output, int(shape.h_k), int(shape.h_v), scale);
     const auto error = cudaGetLastError();

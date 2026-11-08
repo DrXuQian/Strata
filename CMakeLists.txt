@@ -9,6 +9,7 @@
 # and is wrong about its own performance, which is the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
 project(strata VERSION 0.1.58 LANGUAGES CXX)
+include(cmake/ppu_backend.cmake)
 # EXPERIMENTAL: the Intel Arc engine, the SYCL port in sycl/ (PR #423; icpx + oneMKL, docs/INTEL_ARC.md). It is its
 # own project that takes the unported sources from src/; with this on, nothing below is configured.
 option(STRATA_ENABLE_SYCL "EXPERIMENTAL: build the Intel Arc (SYCL) engine from sycl/ - docs/INTEL_ARC.md" OFF)
@@ -559,6 +560,18 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
+  if(STRATA_ENABLE_PPU)
+    target_sources(strata_kernels PRIVATE src/ppu/ncp.cpp src/ppu/kernels.cu)
+    target_link_libraries(strata_kernels PUBLIC ${CMAKE_DL_LIBS})
+    add_executable(ncp_parity EXCLUDE_FROM_ALL tests/ppu/ncp_parity.cu)
+    target_link_libraries(ncp_parity PRIVATE strata_kernels CUDA::cudart)
+    if(STRATA_BUILD_TESTS)
+      foreach(_case gdn-verify gdn-commit gdn-graph gdn-chunked moe fa fa-q8)
+        add_test(NAME ppu_${_case} COMMAND ncp_parity ${_case})
+        set_tests_properties(ppu_${_case} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+      endforeach()
+    endif()
+  endif()
   # Exact gfx1100 prompt scorer (PR1825 method port): optional standalone test,
   # also available where the published source omits tests/.
   option(STRATA_PARITY_GFX1100_QSA_SCORES "Build the exact gfx1100 QSA score/ID check" OFF)
@@ -2323,7 +2336,7 @@ if(STRATA_NATIVE_EXPERTS)
       set(_strata_mmq_tqp ON)   # moe_mmq.cu names GGML_TYPE_TQP5-7 only where the ggml has them (STRATA_MMQ_TQP)
     endif()
     set(_strata_mmq_tq ON)
-  elseif(STRATA_MMQ_TQ_OVERLAY AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP))
+  elseif(STRATA_MMQ_TQ_OVERLAY AND NOT STRATA_ENABLE_PPU AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP))
     # an upstream llama.cpp: the trellis MMQ instances come from an overlay of the pinned ggml-cuda headers written at
     # configure time (cmake/strata_ggml_tq_overlay.cmake); off with a message if the llama.cpp tree is not the pinned one
     if(STRATA_GGML_DIR)
@@ -2351,7 +2364,7 @@ if(STRATA_NATIVE_EXPERTS)
   if(STRATA_ORCA_Q4KS_MMQ)
     list(APPEND _strata_mmq_types q5_0)
   endif()
-  if(STRATA_ENABLE_CUDA)
+  if(STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_PPU)
     # prompt-speed plan step 2b: llama.cpp's MMQ kernels (ggml-cuda, MIT) for the prompt path's experts, compiled
     # from the same checkout as ggml above - only mmq.cuh's instances for the packs' types and the quantizer, with
     # the few host symbols of ggml-cuda.cu they use in src/prefill/ggml_cuda_host.cu

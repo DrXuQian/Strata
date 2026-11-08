@@ -1,6 +1,9 @@
 // src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
 #include "strata/prefill/kernels.hpp"
 #include "strata/prefill/gdn_chunk.hpp"
+#ifdef STRATA_NCP_GDN
+#include "strata/ppu/kernels.hpp"
+#endif
 #include "strata/prefill/gdn_probe.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/gfx_arch.hpp"
@@ -2973,6 +2976,16 @@ static void gdn_recurrence_impl(int variant, float* state, const float* h, const
                                 void* stream, int64_t ld16, bool with_out) {
     if (ld16 <= 0) ld16 = (int64_t) HV * S;
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-block-per-head kernel (A/B)
+#ifdef STRATA_NCP_GDN
+    if (!serial && T > 0 && T <= INT32_MAX &&
+        strata::ppu::gdn(state, state, h, h + HK * S, h + 2 * HK * S, C, C, C,
+                         gate, beta, y, int(T), HK, HV, S, 1.0f / std::sqrt(float(S)), true, stream)) {
+        if (with_out)
+            gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16, ld16);
+        check("gdn_recurrence (NCP)");
+        return;
+    }
+#endif
 #if defined(__HIPCC__)
     if (variant == 0 || variant == 1) {
         // STRATA_GDN_CHUNKED=1 (opt-in): the chunked recurrence on the gfx11 matrix cores, FP16 operands (other bits;

@@ -1353,7 +1353,7 @@ __global__ void __launch_bounds__(256, 1) block_scores_thread_kernel(const float
 constexpr int CL_N = 8;        // CTAs per query (the portable cluster size)
 constexpr int CL_T = 1024;     // threads per CTA
 constexpr int CL_MAXQ = 16;    // larger calls (prefill sub-batches) fill the GPU with one CTA per query already
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && !defined(STRATA_USE_PPU)
 #define STRATA_SEL_CLUSTER 1
 #else
 #define STRATA_SEL_CLUSTER 0   // an older target's code is a trap; qsa_block_topk_cluster never launches it there
@@ -2375,7 +2375,7 @@ static bool topk_active_turing_device() {
 
 bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                             const QsaShapes& s, int32_t* ids, void* stream) {
-#if defined(__HIPCC__)
+#if defined(__HIPCC__) || defined(STRATA_USE_PPU)
     (void) scores; (void) steps; (void) nq; (void) max_blocks; (void) cap; (void) s; (void) ids; (void) stream;
     return false;
 #else
