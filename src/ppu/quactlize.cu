@@ -1,4 +1,5 @@
 #include "strata/ppu/quactlize.hpp"
+#include "strata/ppu/quactlize_graph.hpp"
 #include "strata/ppu/offline.hpp"
 #include "strata/ppu/python.hpp"
 #include "strata/core/dispatch_stats.hpp"
@@ -210,6 +211,16 @@ __global__ void scatter_group(const float* y, const int32_t* group, const int32_
     else out[int64_t(dst[e]) * n + col] = y[i];
 }
 unsigned blocks(size_t elems) { return static_cast<unsigned>((elems + 255) / 256); }
+// One grouped call's scratch: eight experts' planes (and their raw source), activations, outputs and ids.
+bool grouped_scratch(const Shape& shape, int cap_entries, int n, int k, bool packed_input, size_t& need) {
+    const size_t nx = size_t(cap_entries) * k, ny = size_t(cap_entries) * n;
+    static const size_t limit = budget("STRATA_QUACTLIZE_SCRATCH_MIB");
+    if (shape.sizes.raw_bytes > limit || nx > limit / 4 || ny > limit / 4) return false;
+    const size_t capacity = (size_t(cap_entries) + 255) / 256 * 256;
+    need = (packed_input ? 1 : 2) * align(shape.sizes.raw_bytes) + align(capacity * k * 4) + align(capacity * n * 4) +
+        2 * align(capacity * 4);
+    return true;
+}
 }
 
 size_t preload(const void* raw, int type, int n, int k, const char* name) {
@@ -337,10 +348,8 @@ bool grouped(const unsigned long long* ptr, const int32_t* start, const int32_t*
     if (!describe(c, shape)) return false;
     const size_t nx = size_t(cap_entries) * k, ny = size_t(cap_entries) * n;
     const size_t raw_bytes = shape.sizes.raw_bytes;
-    static const size_t limit = budget("STRATA_QUACTLIZE_SCRATCH_MIB");
-    if (raw_bytes > limit || nx > limit / 4 || ny > limit / 4) return false;
-    const size_t capacity=(size_t(cap_entries)+255)/256*256;
-    const size_t need = (packed_input?1:2) * align(raw_bytes) + align(capacity*k*4) + align(capacity*n*4) + 2*align(capacity*4);
+    size_t need = 0;
+    if (!grouped_scratch(shape, cap_entries, n, k, packed_input, need)) return false;
     auto& s = scratch(out, up ? 1 : 2);
     std::lock_guard<std::mutex> lock(s.mutex);
     cudaStream_t cs = static_cast<cudaStream_t>(stream);
@@ -371,5 +380,18 @@ bool grouped(const unsigned long long* ptr, const int32_t* start, const int32_t*
     strata::dispatch::note(packed_input ? "quactlize: offline grouped experts, no shuffle" :
         "quactlize: mutable grouped experts, online shuffle + indexed GEMV");
     return true;
+}
+
+bool prepare_grouped(float* out, bool gate_up, int type, int n, int k, int cap_entries, void* stream,
+                     bool packed_input) {
+    if (!enabled() || !out || cap_entries <= 0 || k % 32 || (gate_up && n % 2)) return false;
+    if (capturing(stream)) throw std::runtime_error("quactlize: grouped scratch must be prepared before graph capture");
+    auto c = call(type, n, k, cap_entries, kGroupBatch);
+    Shape shape;
+    size_t need = 0;
+    if (!describe(c, shape) || !grouped_scratch(shape, cap_entries, n, k, packed_input, need)) return false;
+    auto& s = scratch(out, gate_up ? 1 : 2);
+    std::lock_guard<std::mutex> lock(s.mutex);
+    return reserve(s, need, static_cast<cudaStream_t>(stream));
 }
 } // namespace strata::ppu::quactlize

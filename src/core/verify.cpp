@@ -1,5 +1,6 @@
 #ifdef STRATA_QUACTLIZE
 #include "strata/ppu/offline.hpp"
+#include "strata/ppu/quactlize_graph.hpp"
 #endif
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 // HostGraphLaunch (the graph launched by the calling thread, or by a helper thread so this one can serve the doorbells): CUDA builds,
@@ -1248,6 +1249,27 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                                        int(g.ssm_state_size), cs_);
     } catch (const std::exception& e) {
         err = std::string("verify: actlizeLA preparation: ") + e.what();
+        return false;
+    }
+#endif
+#ifdef STRATA_QUACTLIZE
+    try {
+        // An offline packed expert layer's first grouped gate/up call runs in a captured window, which cannot
+        // allocate, and packed slots have no raw reader to fall back to: reserve that call's scratch (keyed by
+        // hit_scratch_, the gate output) for the widest window now.
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        for (int64_t l = 0; lay.native && strata::ppu::offline::enabled() && l < g.n_layers; ++l) {
+            if (!strata::ppu::offline::layer((int) l)) continue;
+            const auto& f = lay.fmt[(size_t) l];
+            if (!strata::ppu::quactlize::prepare_grouped(static_cast<float*>(hit_scratch_), true, f.gu_type,
+                    (int) (2 * f.n_ff), (int) f.n_embd, (int) (T * K), cs_, true)) {
+                err = "verify: no QUactlize scratch for offline expert layer " + std::to_string(l) +
+                      " (STRATA_QUACTLIZE_SCRATCH_MIB)";
+                return false;
+            }
+        }
+    } catch (const std::exception& e) {
+        err = std::string("verify: QUactlize preparation: ") + e.what();
         return false;
     }
 #endif
