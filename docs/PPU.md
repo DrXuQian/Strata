@@ -1,6 +1,7 @@
 # PPU: installed operator packages
 
-This opt-in backend targets Qwen3.8-Flash-Next on PPU1.0 / ZW810. The engine uses
+This opt-in backend targets Qwen3.8-Flash-Next on PPU1.0 (`ppu10`): ZW810, and ZW610 through
+Strata's device admission below. The engine uses
 the PPU SDK's CUDA-compatible runtime and ACBLAS. Strata contains the adaptation
 layer; operator packages are installed normally and remain unchanged.
 
@@ -94,6 +95,14 @@ PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}" python -m strata_ppu --prepa
 This discovers the packages and prepares native images. It does not establish
 numerical parity. Preparation/import/JIT happens before capture; replay launches
 the captured device work without Python, compilation, or host routing readback.
+
+Device admission first calls the installed actlizeLA check
+(`actlize_la.serving.device.validate_device_target`). actlizeLA 0.2.2 names
+ZW810 for `ppu10`. When it rejects a device, Strata admits it only for target
+`ppu10`, the exact reported name `PPU-ZW610` (the same PPU1.0 kernel
+architecture) and compute capability 8.0, and prints that admission. The device
+name, Torch's device queries and the operator packages are not changed; any
+other mismatch remains an error.
 
 ## Offline weights and offload
 
@@ -198,7 +207,7 @@ and provider dispatch counts are nonzero. Process exit alone does not establish
 model quality, token equivalence, or performance.
 
 Host checks are `tests/ppu/test_bridge.py` (real CPU Torch, embedded Python,
-DLPack ownership/strides/BF16/threads/errors), `test_packages.py` (8 host interface/cache checks),
+DLPack ownership/strides/BF16/threads/errors), `test_packages.py` (9 host interface/cache/admission checks),
 `test_offline_store.py` (19 source/container checks), and `test_fetch_admission.py`
 (raw/packed cache admission in fetch modes 0, 1 and 2). Device tests cover FA with FP16/Q8 KV, BF16 MoE,
 GDN verification/commit/chunks/graph/accepted-prefix/partial output, six quant

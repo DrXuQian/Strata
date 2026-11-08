@@ -7,8 +7,13 @@ unloaded while a captured graph can reference them.
 import importlib
 import math
 import os
+import sys
 
 import torch
+
+# PPU1.0 parts with the ppu10 kernel architecture of ZW810 that the installed
+# actlizeLA admission does not name. The real device name is kept as reported.
+_PPU10_SAME_ARCH = frozenset(("PPU-ZW610",))
 
 _modules = {}
 _plans = {}
@@ -58,7 +63,17 @@ def _device(index, capturing):
         raise RuntimeError("prepare the PPU device before capture")
     from actlize_la.serving.device import validate_device_target
     target = os.environ.get("STRATA_PPU_TARGET", "ppu10")
-    validate_device_target(target, torch.cuda.get_device_name(index))
+    name = torch.cuda.get_device_name(index)
+    try:
+        validate_device_target(target, name)
+    except ValueError:
+        # Only the ppu10 target, a named same-architecture part and its real
+        # compute capability (8.0) are admitted here; every other mismatch stays fatal.
+        if (target != "ppu10" or name.strip().upper() not in _PPU10_SAME_ARCH
+                or tuple(torch.cuda.get_device_capability(index)) != (8, 0)):
+            raise
+        print(f"[strata-ppu] device {index} {name!r}: admitted as ppu10 (same PPU1.0 architecture as ZW810)",
+              file=sys.stderr, flush=True)
     _devices.add(index)
 
 

@@ -106,6 +106,27 @@ class PackageContracts(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError,"pip install --no-build-isolation -e"):
                     jit.source_root("quactlize",["quactlize/packing/word_pack.hpp"])
 
+    def test_ppu10_same_architecture_device_admission(self):
+        # The installed actlizeLA check runs first; host tests stub only the device query.
+        def admit(name,capability=(8,0),target="ppu10"):
+            adapter._devices.clear()
+            with patch.dict("os.environ",{"STRATA_PPU_TARGET":target}), \
+                 patch.object(torch.cuda,"get_device_name",return_value=name), \
+                 patch.object(torch.cuda,"get_device_capability",return_value=capability):
+                adapter._device(3,False)
+            return 3 in adapter._devices
+        try:
+            self.assertTrue(admit("PPU-ZW810"))
+            self.assertTrue(admit("PPU-ZW610"))
+            for name,capability,target in (("PPU-ZW610",(8,9),"ppu10"),("PPU-ZW610",(8,0),"ppu15"),
+                                           ("PPU-ZW6100",(8,0),"ppu10"),("PPU-ZW999",(8,0),"ppu10")):
+                with self.assertRaises(ValueError):
+                    admit(name,capability,target)
+            with self.assertRaisesRegex(RuntimeError,"before capture"):
+                adapter._devices.clear(); adapter._device(3,True)
+        finally:
+            adapter._devices.clear()
+
 
 if __name__=="__main__":
     unittest.main()
