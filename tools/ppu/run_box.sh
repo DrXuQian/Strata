@@ -7,7 +7,8 @@ PPU_SDK=/path/to/sdk bash tools/ppu/run_box.sh
 Uses the supplied /sim/eec/shared/AI_workspace model and MTP locations.
 Overrides: MODEL_DIR, MTP_RT, STRATA_MODEL_PACK, STRATA_QUACTLIZE_PACK,
 PROMPT_IDS, EXPERT_PROFILE, EXPERT_CACHE (default 256), WITH_MTP (default 1),
-BUILD_DIR, OUT_DIR, PYTHON, CMAKE, JOBS, PPU_CUDA_ARCH (default 80).
+BUILD_DIR, OUT_DIR, PYTHON, CMAKE, JOBS, PPU_CUDA_ARCH (default 80),
+CUDA_VISIBLE_DEVICES (one PCI-order device index, default 0; also the engine's --gpu).
 The four operator packages and platform Torch must already be installed in PYTHON.
 Creates new pack directories if absent. Existing prepared packs are reused.
 HELP
@@ -20,6 +21,13 @@ export OUT_DIR=${OUT_DIR:-"$BUILD_DIR/box-$(date -u +%Y%m%dT%H%M%SZ)"}
 export PPU_CUDA_ARCH=${PPU_CUDA_ARCH:-80}
 export STRATA_PPU_TARGET=${STRATA_PPU_TARGET:-ppu10}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+# The engine's --gpu is a PCI-order device index and sets CUDA_VISIBLE_DEVICES itself. Give it the same single
+# device, in the same order, so the package checks and the model runs use one card.
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+if [[ ! $CUDA_VISIBLE_DEVICES =~ ^[0-9]+$ ]]; then
+    printf 'Set CUDA_VISIBLE_DEVICES to one device index (got %s).\n' "$CUDA_VISIBLE_DEVICES" >&2
+    exit 2
+fi
 export PYTHON=${PYTHON:-python3}
 export LD_LIBRARY_PATH="$PPU_SDK/CUDA_SDK/lib64:$PPU_SDK/lib:$PPU_SDK/targets/x86_64-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 model_dir=${MODEL_DIR:-/sim/eec/shared/AI_workspace/llm-models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL}
@@ -68,15 +76,18 @@ Path(sys.argv[3]).write_text(' '.join(map(str,ids))+'\n')
 print(f'Prepared {len(ids)} prompt tokens using the pack tokenizer')
 PY
 fi
-args=(--gpu 0 --pack "$pack" --native "$model" --tokens-file "$prompt" --prefill 128 \
+args=(--gpu "$CUDA_VISIBLE_DEVICES" --pack "$pack" --native "$model" --tokens-file "$prompt" --prefill 128 \
       --spec 4 --max-context 4096 --max-new "${MAX_NEW:-32}" --kv int8 --greedy --stats)
 if [[ ${WITH_MTP:-1} == 1 ]]; then args+=(--mtp "$mtp"); fi
 profile=${EXPERT_PROFILE:-"$OUT_DIR/expert-profile.bin"}
 if [[ -z ${EXPERT_PROFILE:-} ]]; then
     # A trace from this prompt ranks the cache. A/B runs then use the same
     # profile and cache size; the trace run is not a performance measurement.
+    # Verify windows (--spec) need a residency table, so the trace runs on the
+    # shipped ranking (data/expert-profile.bin) with the same cache size.
     env STRATA_PPU_FA=0 STRATA_PPU_MOE=0 STRATA_PPU_GDN=0 STRATA_QUACTLIZE=0 \
-        "$BUILD_DIR/strata" generate "${args[@]}" --expert-cache 0 \
+        "$BUILD_DIR/strata" "${args[@]}" --expert-profile "$repo/data/expert-profile.bin" \
+        --expert-cache "${EXPERT_CACHE:-256}" \
         --dump-routing "$OUT_DIR/profile.trace" 2>&1 | tee "$OUT_DIR/profile-run.log"
     [[ -s "$OUT_DIR/profile.trace" ]] || { printf 'Routing trace is empty; cannot rank the expert cache.\n' >&2; exit 1; }
     "$PYTHON" "$repo/tools/make_profile.py" "$OUT_DIR/profile.trace" --no-base --out "$profile"

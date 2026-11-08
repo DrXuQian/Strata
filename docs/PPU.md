@@ -118,7 +118,7 @@ python tools/iq_pack.py --gguf "$MODEL" --out "$STRATA_PACK" --compat-bf16
 build-ppu-python/strata-ppu-pack --gguf "$MODEL" --out "$KPACK"
 
 STRATA_QUACTLIZE=1 STRATA_QUACTLIZE_PACK="$KPACK" \
-  build-ppu-python/strata generate --gpu 0 --pack "$STRATA_PACK" --native "$MODEL" \
+  build-ppu-python/strata --gpu 0 --pack "$STRATA_PACK" --native "$MODEL" \
   --tokens-file "$PROMPT_IDS" --prefill 128 --spec 4 \
   --max-context 4096 --max-new 32 --kv int8 --greedy --stats
 ```

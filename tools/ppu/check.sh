@@ -59,11 +59,11 @@ if (( $# )); then
     for providers in 0 1; do
         env STRATA_PPU_FA="$providers" STRATA_PPU_MOE="$providers" STRATA_PPU_GDN="$providers" \
             STRATA_QUACTLIZE=0 STRATA_DISPATCH_STATS=1 STRATA_DISPATCH_REPORT="$out/dispatch-packages-$providers.json" \
-            "$build/strata" generate "$@" 2>&1 | tee "$out/model-packages-$providers.log"
+            "$build/strata" "$@" 2>&1 | tee "$out/model-packages-$providers.log"
     done
     env STRATA_PPU_FA=1 STRATA_PPU_MOE=1 STRATA_PPU_GDN=1 STRATA_QUACTLIZE=1 STRATA_DISPATCH_STATS=1 \
         STRATA_DISPATCH_REPORT="$out/dispatch-quactlize.json" \
-        "$build/strata" generate "$@" 2>&1 | tee "$out/model-quactlize.log"
+        "$build/strata" "$@" 2>&1 | tee "$out/model-quactlize.log"
 fi
 printf 'Completed command checks. Logs: %s\n' "$out"
 printf 'Assess model output and dispatch counts before comparing performance.\n'
