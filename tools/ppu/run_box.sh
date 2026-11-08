@@ -46,7 +46,8 @@ if [[ ${WITH_MTP:-1} == 1 ]]; then
     done
 fi
 bash "$repo/tools/ppu/check.sh"
-if [[ ! -s "$pack/dense.txt" ]]; then
+# iq_pack.py publishes native_experts.txt last; it is the pack's completion marker (there is no dense.txt).
+if [[ ! -s "$pack/native_experts.txt" || ! -s "$pack/index.txt" ]]; then
     "$PYTHON" "$repo/tools/iq_pack.py" --gguf "$model" --out "$pack" --compat-bf16
 fi
 if [[ ! -s "$STRATA_QUACTLIZE_PACK/index.txt" ]]; then
