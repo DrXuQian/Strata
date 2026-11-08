@@ -195,7 +195,7 @@ STRATA_QUACTLIZE=1 STRATA_QUACTLIZE_PACK=/path/to/quactlize-pack \
   --pack /path/to/strata-pack \
   --native /path/to/model-00001-of-00002.gguf \
   --tokens-file /path/to/prompt.ids \
-  --prefill 128 --max-context 4096 --max-new 32 --kv int8 --greedy --stats
+  --prefill 128 --spec 4 --max-context 4096 --max-new 32 --kv int8 --greedy --stats
 ```
 
 `--gguf` discovers all shards. The output must be a new directory. Preparation
@@ -307,11 +307,17 @@ bash tools/ppu/check.sh -- \
   --native /path/to/model-00001-of-00002.gguf \
   --ple-gguf /path/to/model-00002-of-00002.gguf \
   --tokens-file /path/to/prompt.ids \
-  --prefill 128 --max-context 4096 --max-new 32 --kv int8 --greedy --stats
+  --prefill 128 --spec 4 --max-context 4096 --max-new 32 --kv int8 --greedy --stats
 ```
 
-The shard names are examples; use this pack's actual files. Pass the same MTP,
-expert-cache and other model arguments to both runs through this command.
+The shard names are examples; use this pack's actual files. Native packs require
+`--spec` of at least 2, including runs without an MTP drafter. To use an existing
+MTP runtime pack, append `--mtp /path/to/mtp/rt`; this directory must contain
+`dense.txt`, `dense.bin` and `experts.bin`. The CUDA/PPU loader takes the runtime
+directory, not the MTP GGUF filename. If only the GGUF exists, prepare it with
+`python tools/mtp_rt.py --gguf /path/to/mtp-q2_0.gguf --out /path/to/mtp/rt`.
+Pass the same MTP, expert-cache and other model arguments to all runs through
+this command.
 Logs, binary/library hashes and dispatch reports go into a dated directory under
 `build-ppu`. Model output equivalence and performance still need to be assessed
 from the saved runs; a zero process exit code does not establish either result.
@@ -368,7 +374,7 @@ bash tools/ppu/check.sh -- \
   --native /path/to/model-00001-of-00002.gguf \
   --ple-gguf /path/to/model-00002-of-00002.gguf \
   --tokens-file /path/to/prompt.ids \
-  --prefill 128 --max-context 4096 --max-new 32 --kv int8 --greedy --stats
+  --prefill 128 --spec 4 --max-context 4096 --max-new 32 --kv int8 --greedy --stats
 ```
 
 This builds `quactlize_parity` and `strata-ppu-pack` and adds six strict checks:
