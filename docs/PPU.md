@@ -87,6 +87,77 @@ This does not implement persistent BF16 expert repacking, grouped multi-expert
 NCP decode, NCP state snapshots, or NCP FA decode with device-side lengths.
 DeepSeek and the separate `strata-split` engine are rejected by this build mode.
 
+## Quactlize and online shuffle
+
+Build with `-DSTRATA_QUACTLIZE=ON` (the PPU build's default), then opt in at
+process startup with `STRATA_QUACTLIZE=1`. The runtime default is off. This uses
+the same additive producer/execution C ABI as the local llama.cpp, with no
+changes to the shared libraries:
+
+```sh
+export QUACTLIZE_PPU_BUNDLE=/path/to/quactlize/producer-directory
+export QUACTLIZE_KPACK_EXECUTION=/path/to/quactlize/execution-directory
+export STRATA_QUACTLIZE=1
+```
+
+The first directory contains `libquactlize_ppu_pack.so`; the second contains
+`libquactlize_ppu_execution.so`. `QUACTLIZE_PPU_PACK_LIBRARY=/absolute/file.so`
+overrides the producer path, as in llama.cpp. An explicitly enabled integration
+with a missing/incompatible library fails with its path or missing symbol.
+
+| Path | Shuffle and computation |
+| --- | --- |
+| Immutable native dense/head weights | GPU shuffle at load into a bounded resident K-pack cache; ready event waited by readers, including graph capture |
+| Dense decode and native prompt GEMMs | Arrangement-aware K-pack GEMV, with F16/F32 inputs; Q8_1-only callers expand their existing activation values first |
+| Prompt expert gate/up | Pack the current contiguous `[gate; up]` blob; convert the result to Strata's interleaved output order |
+| Grouped expert decode | Gather the current device-selected pointers in batches of eight, shuffle, run indexed GEMV, and restore entry/destination order |
+| Expert down | Quactlize when its type/geometry is admitted; otherwise the original down kernel, or NCP/ACBLAS prompt path |
+
+The GPU producer supplies the canonical layout descriptor. Both producer and
+consumer must accept it and agree on every plane size. Supported formats are
+Q8_0 and Q2_K through Q6_K, subject to the loaded library's geometry checks.
+The current consumer requires N and K multiples of 256; Q3_K/Q6_K need K a
+multiple of 512. Flash-Next's merged gate/up is N=1280, K=2560. Its individual
+640-row gate/up and K=640 down are not admitted separately. IQ and Q2_0 packs
+retain their original expert kernels; enabling quactlize does not change their
+quantization format.
+
+**Dynamic experts are shuffled again after selection, not permanently shuffled
+inside the residency cache.** Their raw pointers can change content during
+adaptive swaps, PCIe staging and prompt loans. No packed expert is cached by
+pointer, and graph replay repacks the current contents without reading IDs on
+the host. This preserves CPU offload, prefetch and cache policies. It adds GPU
+gather/shuffle work and is not the byte-neutral persistent-buffer integration
+used in llama.cpp.
+
+The original GPU GGUF bytes also remain for immutable matrices so existing
+fused, sliced and fallback readers stay valid. `STRATA_QUACTLIZE_CACHE_MIB`
+bounds the additional resident copies per device (default 256 MiB, 0 disables
+those copies). `STRATA_QUACTLIZE_SCRATCH_MIB` bounds all retained temporary
+allocations per device (default 256 MiB). Allocation failure or budget exhaustion
+uses the original reader before any work is submitted. These are allocation
+budgets, not pre-reserved memory. The resident copies are charged in the native
+dense allocation report and logged individually at load.
+
+Scratch belongs to each output allocation/operation. It can grow outside
+capture; older storage is retained for live graphs and counts against the
+budget. A capture that needs unprepared scratch retains the original kernels.
+Prepared graph calls read fresh activation, routing and expert bytes on replay.
+Prompt ring slots are released only after all raw-weight readers finish.
+
+This first binding uses the shared SIMT reader with the explicit
+`columns=16, warps=4, split=1` recipe. It does not import llama.cpp's measured
+GEMV policy, TC dispatcher, JIT, persistent disk cache or automatic prefill
+selector. The recipe is a correctness baseline, not a measured speed choice.
+FP16 weight/activation arithmetic can differ from native integer-dot kernels;
+numerical and model A/B checks on the box are required before evaluating speed.
+
+Dispatch reports distinguish `quactlize: resident K-pack GEMV`,
+`quactlize: online shuffle + GEMV` and
+`quactlize: mutable grouped experts, online shuffle + indexed GEMV` from
+scratch/capture fallback. A loaded library alone does not show that a model
+used it.
+
 ## Controls and diagnostics
 
 `STRATA_NCP_FA`, `STRATA_NCP_MOE` and `STRATA_NCP_GDN` are CMake options, defaulting
@@ -163,6 +234,7 @@ Loader tests require only a C++17 compiler and Python:
 
 ```sh
 python tests/ppu/test_loader.py --build-dir /workspace/strata-ppu-loader-tests
+python tests/ppu/test_quactlize_loader.py --build-dir /workspace/strata-quactlize-loader-tests
 ```
 
 They use ABI fixture libraries, not simulated model computations, to check
@@ -194,3 +266,37 @@ Then compare the same Qwen3.8-Flash-Next pack, prompts, context, sampling and MT
 settings with each NCP switch on and off. Check output quality, accepted draft
 tokens, memory use, prefill latency and decode throughput separately. No physical
 PPU or full-model performance result is supplied by the source build alone.
+
+To include quactlize, use the existing libraries on the box:
+
+```sh
+PPU_SDK=/path/to/PPU_SDK \
+NCP_LIB_DIR=/path/to/shared/ncp-libs \
+LLAMA_CPP_DIR=/path/to/llama.cpp \
+PPU_CUDA_ARCH=80 \
+WITH_QUACTLIZE=1 \
+QUACTLIZE_PPU_BUNDLE=/path/to/quactlize/producer-directory \
+QUACTLIZE_KPACK_EXECUTION=/path/to/quactlize/execution-directory \
+bash tools/ppu/check.sh -- \
+  --pack /path/to/strata-pack \
+  --native /path/to/model-00001-of-00002.gguf \
+  --ple-gguf /path/to/model-00002-of-00002.gguf \
+  --tokens-file /path/to/prompt.ids \
+  --prefill 128 --max-context 4096 --max-new 32 --kv int8 --greedy --stats
+```
+
+This builds `quactlize_parity` and adds five strict checks: dense, grouped,
+graph, fallback and budget. The CPU oracle quantizes and dequantizes raw GGUF
+blocks through ggml, independently of the GPU producer. Tests include all six
+formats, strided inputs/outputs, beta, F16/F32/Q8_1 input, merged gate/up order,
+mutable expert replacement at the same address, two batches of routed groups,
+empty groups, destination scatter, cross-stream graph replay, the ready event,
+and calls that must decline without touching output. Missing hardware returns
+77 and stops the box script; it is not a numerical pass.
+
+With model arguments, logs contain three runs: native (`NCP=0, quactlize=0`),
+NCP (`1,0`) and NCP plus quactlize (`1,1`). Compare the last two to isolate this
+change. Confirm a quactlize computation counter in `dispatch-quactlize-1.json`;
+unsupported quantization or insufficient memory can leave a model entirely on
+the original path. Quality/performance admission is still a separate review of
+the saved results. Local source compilation cannot establish a PPU box result.

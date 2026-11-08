@@ -1,4 +1,7 @@
 #include "strata/core/native_head.hpp"
+#ifdef STRATA_QUACTLIZE
+#include "strata/ppu/quactlize.hpp"
+#endif
 #include "strata/core/spill_gate.hpp"
 #include "strata/core/run_manifest.hpp"
 #include "strata/artifact/gguf_reader.hpp"
@@ -20,6 +23,9 @@ NativeHead::~NativeHead() {
 }
 
 void NativeHead::unload() {
+#ifdef STRATA_QUACTLIZE
+    strata::ppu::quactlize::release(weights_);
+#endif
     if (weights_) strata::kernels::native_q6_k_unpack(weights_);
     if (weights_) strata::kernels::native_q8_0_sm60_release(weights_);
     if (scratch_) cudaFree(scratch_);
@@ -104,6 +110,12 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         n_in_ = (int) n_in;
         n_out_ = (int) n_out;
         type_ = (int) tensor->type;
+#ifdef STRATA_QUACTLIZE
+        if (strata::ppu::quactlize::enabled()) {
+            if (!host_) strata::ppu::quactlize::preload(weights_, type_, n_out_, n_in_);
+            return true; // The original GGUF copy must not be repacked in place.
+        }
+#endif
         if (type_ == 14 && strata::kernels::native_q6_k_packed_enabled())   // STRATA_Q6_PACKED=1
             strata::kernels::native_q6_k_pack(weights_, n_in_, n_out_, "output head");
         if (type_ == 8)   // STRATA_Q8_SM60=1 (a no-op otherwise); the MTP draft head reads the same matrix
@@ -140,6 +152,10 @@ bool NativeHead::to_host(std::string& err) {
         err = "native head: the head could not be moved to host memory";
         return false;
     }
+#ifdef STRATA_QUACTLIZE
+    // A successful spill invalidates both device representations together.
+    strata::ppu::quactlize::release(weights_);
+#endif
     cudaFree(weights_);
     weights_ = dp;
     host_ = hp;
@@ -152,6 +168,10 @@ bool NativeHead::run(const float* mixed, float* logits, void* stream, std::strin
         return false;
     }
     try {
+#ifdef STRATA_QUACTLIZE
+        if (strata::ppu::quactlize::dense(weights_, type_, n_out_, n_in_, mixed,
+            strata::ppu::quactlize::Input::f32, 1, logits, stream)) return true;
+#endif
         if (type_ == 13) {
             strata::kernels::native_q5_k_f32(weights_, mixed, scratch_, logits, n_in_, n_out_, 1, stream);
         } else {

@@ -1,3 +1,6 @@
+#ifdef STRATA_QUACTLIZE
+#include "strata/ppu/quactlize.hpp"
+#endif
 // Adapted from llama.cpp 3cf03257f219afbe7334045ff7c6a06ac68c627d:
 // ggml/src/ggml-cuda/{quantize.cu,vecdotq.cuh,mmvq.cu,common.cuh}
 // and ggml/src/ggml-common.h. See docs/native-mmvq.md for exact scope.
@@ -2822,6 +2825,9 @@ bool q6_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in,
 } // namespace
 
 bool native_q8_0_packed_enabled() {
+#ifdef STRATA_QUACTLIZE
+    if (strata::ppu::quactlize::enabled()) return false;
+#endif
     static const bool enabled = [] {
         const char* v = std::getenv("STRATA_Q8_PACKED");
         return v && v[0] == '1' && v[1] == '\0';
@@ -2952,6 +2958,9 @@ bool native_q8_0_sm60_pack_in_place(void* weights, int n_in, int n_out, const ch
 }
 
 bool native_q6_k_packed_enabled() {
+#ifdef STRATA_QUACTLIZE
+    if (strata::ppu::quactlize::enabled()) return false;
+#endif
     static const bool enabled = [] {
         const char* v = std::getenv("STRATA_Q6_PACKED");
         return v && v[0] == '1' && v[1] == '\0';
@@ -3119,6 +3128,10 @@ void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_
 
 void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream) {
+#ifdef STRATA_QUACTLIZE
+    if (strata::ppu::quactlize::dense(weights, 13, n_out, n_in, x_q8_1,
+        strata::ppu::quactlize::Input::q8_1, ncols, y, stream)) return;
+#endif
     validate_shape(n_in, ncols, QK);
     if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
     validate_pointer(weights);
@@ -3146,6 +3159,10 @@ void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
 
 void native_q5_k_f32(const void* weights, const float* x, void* scratch_q8_1,
                      float* y, int n_in, int n_out, int ncols, void* stream) {
+#ifdef STRATA_QUACTLIZE
+    if (strata::ppu::quactlize::dense(weights, 13, n_out, n_in, x,
+        strata::ppu::quactlize::Input::f32, ncols, y, stream)) return;
+#endif
     // Validate all outputs before enqueueing the first operation.
     validate_shape(n_in, ncols, QK);
     if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
@@ -3285,6 +3302,10 @@ void native_q2_0_f32(const void* weights, const float* x, void* scratch_q8_1,
 
 void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream) {
+#ifdef STRATA_QUACTLIZE
+    if (strata::ppu::quactlize::dense(weights, 11, n_out, n_in, x_q8_1,
+        strata::ppu::quactlize::Input::q8_1, ncols, y, stream)) return;
+#endif
     validate_shape(n_in, ncols, 256);
     if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
     validate_pointer(weights);
@@ -3312,6 +3333,10 @@ void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
 
 void native_q3_k_f32(const void* weights, const float* x, void* scratch_q8_1,
                      float* y, int n_in, int n_out, int ncols, void* stream) {
+#ifdef STRATA_QUACTLIZE
+    if (strata::ppu::quactlize::dense(weights, 11, n_out, n_in, x,
+        strata::ppu::quactlize::Input::f32, ncols, y, stream)) return;
+#endif
     validate_shape(n_in, ncols, 256);
     if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
     validate_pointer(weights);
@@ -3365,6 +3390,10 @@ void native_iq4_xs_f32(const void* weights, const float* x, void* scratch_q8_1,
 
 void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream) {
+#ifdef STRATA_QUACTLIZE
+    if (strata::ppu::quactlize::dense(weights, 12, n_out, n_in, x_q8_1,
+        strata::ppu::quactlize::Input::q8_1, ncols, y, stream)) return;
+#endif
     validate_shape(n_in, ncols, 256);
     if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
     validate_pointer(weights);
@@ -3392,6 +3421,10 @@ void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
 
 void native_q4_k_f32(const void* weights, const float* x, void* scratch_q8_1,
                      float* y, int n_in, int n_out, int ncols, void* stream) {
+#ifdef STRATA_QUACTLIZE
+    if (strata::ppu::quactlize::dense(weights, 12, n_out, n_in, x,
+        strata::ppu::quactlize::Input::f32, ncols, y, stream)) return;
+#endif
     validate_shape(n_in, ncols, 256);
     if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
     validate_pointer(weights);
@@ -3405,6 +3438,10 @@ void native_q4_k_f32(const void* weights, const float* x, void* scratch_q8_1,
 
 void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream) {
+#ifdef STRATA_QUACTLIZE
+    if (strata::ppu::quactlize::dense(weights, 14, n_out, n_in, x_q8_1,
+        strata::ppu::quactlize::Input::q8_1, ncols, y, stream)) return;
+#endif
     if (q6_packed_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;   // STRATA_Q6_PACKED=1 heads
     validate_shape(n_in, ncols, 256);
     if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
@@ -3433,6 +3470,10 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
 
 void native_q6_k_f32(const void* weights, const float* x, void* scratch_q8_1,
                      float* y, int n_in, int n_out, int ncols, void* stream) {
+#ifdef STRATA_QUACTLIZE
+    if (strata::ppu::quactlize::dense(weights, 14, n_out, n_in, x,
+        strata::ppu::quactlize::Input::f32, ncols, y, stream)) return;
+#endif
     validate_shape(n_in, ncols, 256);
     if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
     validate_pointer(weights);
@@ -3477,6 +3518,9 @@ void q8_0_pair_launch(const Q80Block* w1, const Q80Block* w2, const Q81Block* x,
 
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
                       int n_in, int n_out, int ncols, void* stream) {
+#ifdef STRATA_QUACTLIZE
+    if (strata::ppu::quactlize::enabled()) return false;
+#endif
     using F = SmallTraits<Q80Block, 8>;
     // only where both calls would run native_mmvq_multi_kernel<F, ncols, WARPS, 1> (exact layout, not packed)
     if (ggml_type != 8 || !g_multi_exact || ncols < 2 || ncols > 8 || n_out <= 0 || n_in <= 0 || n_in % 32 != 0 ||
@@ -3503,12 +3547,20 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
 
 void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
+#ifdef STRATA_QUACTLIZE
+    if (strata::ppu::quactlize::dense(weights, 8, n_out, n_in, x_q8_1,
+        strata::ppu::quactlize::Input::q8_1, ncols, y, stream)) return;
+#endif
     if (q8_packed_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;   // STRATA_Q8_PACKED=1 tensors
     small_mmvq<Q80Block, 8>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
 }
 
 void native_q8_0_f32(const void* weights, const float* x, void* scratch_q8_1,
                       float* y, int n_in, int n_out, int ncols, void* stream) {
+#ifdef STRATA_QUACTLIZE
+    if (strata::ppu::quactlize::dense(weights, 8, n_out, n_in, x,
+        strata::ppu::quactlize::Input::f32, ncols, y, stream)) return;
+#endif
     small_f32<Q80Block, 8>(weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
 }
 
@@ -3966,6 +4018,10 @@ bool native_mmvq_il_supported(int ggml_type, int ncols, int n_out) {
 
 void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, const void* x_il, float* y, int n_in,
                     int n_out, int ncols, void* stream) {
+#ifdef STRATA_QUACTLIZE
+    if (strata::ppu::quactlize::dense(weights, ggml_type, n_out, n_in, x_q8_1,
+        strata::ppu::quactlize::Input::q8_1, ncols, y, stream)) return;
+#endif
     if (!native_mmvq_il_supported(ggml_type, ncols, n_out)) {
         native_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream);
         return;

@@ -1,3 +1,7 @@
+#ifdef STRATA_QUACTLIZE
+#include "strata/ppu/quactlize.hpp"
+#include <climits>
+#endif
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/prefill/prefill.hpp"
@@ -5997,6 +6001,34 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 return true;
                             }
                             const int q = (int) (j % DQ);
+#ifdef STRATA_QUACTLIZE
+                            if (lay.native && !lay.fmt[(size_t) l].tail_off && strata::ppu::quactlize::enabled()) {
+                                const auto& f = lay.fmt[(size_t) l];
+                                const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
+                                pt.mark(kPfGemmGU, cs);
+                                if (ne <= INT_MAX && strata::ppu::quactlize::dense(blob_dev, f.gu_type, 1280, (int) N,
+                                        m.Xs + o0 * N, strata::ppu::quactlize::Input::f16, (int) ne,
+                                        m.GU + o0 * 1280, m.cs, 0, 0, 0, true)) {
+                                    swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
+                                    if (had_d) strata::kernels::hadamard_rows_f16(m.Hh + o0 * 640, ne, 640, had_block, had_sh, m.cs);
+                                    pt.mark(kPfGemmD, cs);
+                                    if (!strata::ppu::quactlize::dense(blob_dev + f.down_off, f.d_type, (int) N, 640,
+                                            m.Hh + o0 * 640, strata::ppu::quactlize::Input::f16, (int) ne,
+                                            m.Dm + o0 * N, m.cs)) {
+                                        strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off,
+                                            f.n_embd * f.n_ff, m.dq_d[q], m.cs, nullptr);
+#ifdef STRATA_NCP_MOE
+                                        if (!strata::ppu::expert_f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640, m.cs))
+#endif
+                                        m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
+                                    }
+                                    // Release a streaming slot after BOTH packed readers have consumed it.
+                                    if (slot >= 0) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
+                                    return true;
+                                }
+                                pt.mark(kPfDequant, cs);
+                            }
+#endif
                             if (lay.native) {
                                 // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
                                 const auto& f = lay.fmt[(size_t) l];
@@ -7278,7 +7310,11 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                     } else {
                         blob_dequant_f16(blob_dev, m.dq_gu[dq], m.dq_d[dq], cs);
                     }
-                    if (stage_of[u] >= 0) {   // the blob is read by the dequant: its ring slot is free
+                    if (stage_of[u] >= 0
+#ifdef STRATA_QUACTLIZE
+                        && !strata::ppu::quactlize::enabled()
+#endif
+                    ) {   // quactlize also reads raw bytes below; defer its release until the last entry
                         cudaEventRecord(m.used[stage_of[u]], cs);
                         m.used_of[stage_of[u]] = stage_of[u];
                     }
@@ -7287,16 +7323,34 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                 const int64_t o = ents[j].r0 - gp.r0, nr = ents[j].nr;
                 gather_rows16(lb.mixed_h, d_row_tok + ents[j].r0, m.Xs + o * N, nr, N, cs);
                 pt.mark(kPfGemmGU, cs);
+#ifdef STRATA_QUACTLIZE
+                if (!(lay.native && nr <= INT_MAX && !lay.fmt[(size_t) l].tail_off &&
+                    strata::ppu::quactlize::dense(blob_dev, lay.fmt[(size_t) l].gu_type, 1280, (int) N,
+                        m.Xs + o * N, strata::ppu::quactlize::Input::f16, (int) nr, m.GU + o * 1280,
+                        m.cs, 0, 0, 0, true)))
+#endif
 #ifdef STRATA_NCP_MOE
                 if (!strata::ppu::expert_f16(m.Xs + o * N, m.dq_gu[dq], m.GU + o * 1280, nr, 1280, N, m.cs))
 #endif
                 m.gemm.f16(m.Xs + o * N, m.dq_gu[dq], m.GU + o * 1280, nr, 1280, N);
                 swiglu_interleaved(m.GU + o * 1280, m.Hh + o * 640, nr, cs);
                 pt.mark(kPfGemmD, cs);
+#ifdef STRATA_QUACTLIZE
+                if (!(lay.native && nr <= INT_MAX && !lay.fmt[(size_t) l].tail_off &&
+                    strata::ppu::quactlize::dense(blob_dev + lay.fmt[(size_t) l].down_off,
+                        lay.fmt[(size_t) l].d_type, (int) N, 640, m.Hh + o * 640,
+                        strata::ppu::quactlize::Input::f16, (int) nr, m.Dm + o * N, m.cs)))
+#endif
 #ifdef STRATA_NCP_MOE
                 if (!strata::ppu::expert_f16(m.Hh + o * 640, m.dq_d[dq], m.Dm + o * N, nr, N, 640, m.cs))
 #endif
                 m.gemm.f16(m.Hh + o * 640, m.dq_d[dq], m.Dm + o * N, nr, N, 640);
+#ifdef STRATA_QUACTLIZE
+                if (strata::ppu::quactlize::enabled() && stage_of[u] >= 0 && j == last_ent[u]) {
+                    cudaEventRecord(m.used[stage_of[u]], cs);
+                    m.used_of[stage_of[u]] = stage_of[u];
+                }
+#endif
                 if (j + 1 < gp.j1) continue;
                 pt.mark(kPfCombine, cs);
                 moe_scatter_add(m.Dm, d_u_tok + gp.u_at, d_u_off + gp.uo_at, d_u_rows + gp.r0,
