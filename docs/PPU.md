@@ -133,6 +133,9 @@ refill and prompt loans use the converted source. CPU execution and CPU
 complement eviction use the original raw GGUF source. Packed grouped execution
 reads fresh device routing and expert pointers on replay. Offline execution
 never shuffles model weights at runtime. Raw PCIe misses retain their raw reader.
+`STRATA_ADAPT_FETCH` does not admit those raw misses directly into packed cache
+slots. Packed layers keep the converted adaptive refill path, including with
+`STRATA_ADAPT_FETCH=2`; unpacked layers retain upstream direct admission.
 
 Supported K-pack types are Q8_0 and Q2_K through Q6_K, with N/K divisible by 256
 and Q3_K/Q6_K K divisible by 512. Other shapes/types retain their original raw
@@ -195,8 +198,9 @@ and provider dispatch counts are nonzero. Process exit alone does not establish
 model quality, token equivalence, or performance.
 
 Host checks are `tests/ppu/test_bridge.py` (real CPU Torch, embedded Python,
-DLPack ownership/strides/BF16/threads/errors) `test_packages.py` (8 host interface/cache checks), and `test_offline_store.py` (19
-source/container checks). Device tests cover FA with FP16/Q8 KV, BF16 MoE,
+DLPack ownership/strides/BF16/threads/errors), `test_packages.py` (8 host interface/cache checks),
+`test_offline_store.py` (19 source/container checks), and `test_fetch_admission.py`
+(raw/packed cache admission in fetch modes 0, 1 and 2). Device tests cover FA with FP16/Q8 KV, BF16 MoE,
 GDN verification/commit/chunks/graph/accepted-prefix/partial output, six quant
 formats, dynamic routing/weight replacement, graph replay, budgets and offline
 artifacts. A no-device exit 77 is a failed box validation, not a pass.

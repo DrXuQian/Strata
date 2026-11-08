@@ -116,22 +116,36 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         type_ = (int) tensor->type;
 #ifdef STRATA_QUACTLIZE
         if (strata::ppu::quactlize::enabled()) {
+            // Keep the original GGUF backing; QUactlize holds a separate packed copy.
             if (!host_) strata::ppu::quactlize::preload(weights_, type_, n_out_, n_in_, "output.weight");
-            return true; // The original GGUF copy must not be repacked in place.
-        }
+        } else {
 #endif
         if (type_ == 14 && strata::kernels::native_q6_k_packed_enabled())   // STRATA_Q6_PACKED=1
             strata::kernels::native_q6_k_pack(weights_, n_in_, n_out_, "output head");
         if (type_ == 8)   // STRATA_Q8_SM60=1 (a no-op otherwise); the MTP draft head reads the same matrix
             strata::kernels::native_q8_0_sm60_pack(weights_, n_in_, n_out_, "output head");
+#ifdef STRATA_QUACTLIZE
+        }
+#endif
         if (strata::core::manifest::enabled()) {   // STRATA_MANIFEST: what the head holds and where
             namespace mf = strata::core::manifest;
             mf::instance().tensors("head", strata::ggml_type_name((uint32_t) type_), 1, bytes);
             mf::instance().path("head", "output.weight", true,
                                 host_ != nullptr ? "held in mapped pinned host memory (short of VRAM or STRATA_HEAD_HOST)" : "held in VRAM",
                                 std::string("type ") + strata::ggml_type_name((uint32_t) type_) +
-                                    (type_ == 14 && strata::kernels::native_q6_k_packed_enabled() ? ", repacked (STRATA_Q6_PACKED)" : "") +
-                                    (type_ == 8 && std::getenv("STRATA_Q8_SM60") != nullptr ? ", repacked (STRATA_Q8_SM60)" : ""));
+#ifdef STRATA_QUACTLIZE
+                                (strata::ppu::quactlize::enabled() ? ", QUactlize (raw GGUF backing)" : "") +
+#endif
+                                    (type_ == 14 &&
+#ifdef STRATA_QUACTLIZE
+                                     !strata::ppu::quactlize::enabled() &&
+#endif
+                                     strata::kernels::native_q6_k_packed_enabled() ? ", repacked (STRATA_Q6_PACKED)" : "") +
+                                    (type_ == 8 &&
+#ifdef STRATA_QUACTLIZE
+                                     !strata::ppu::quactlize::enabled() &&
+#endif
+                                     std::getenv("STRATA_Q8_SM60") != nullptr ? ", repacked (STRATA_Q8_SM60)" : ""));
         }
         return true;
     } catch (const std::exception& error) {

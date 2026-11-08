@@ -33,6 +33,8 @@ if [[ ${STRATA_CHECK_MODEL_ONLY:-0} != 1 ]]; then
 # is a failure of this box command, not a successful numerical measurement.
 "$python_bin" "$repo/tests/ppu/test_bridge.py" --build-dir "$out/bridge" 2>&1 | tee "$out/bridge.log"
 "$python_bin" "$repo/tests/ppu/test_offline_store.py" --build-dir "$out/offline-store" 2>&1 | tee "$out/offline-store.log"
+"$python_bin" "$repo/tests/ppu/test_fetch_admission.py" --build-dir "$out/fetch-admission" \
+    --cuda-include "$PPU_SDK/CUDA_SDK/include" 2>&1 | tee "$out/fetch-admission.log"
 "$python_bin" "$repo/tests/ppu/test_packages.py" -v 2>&1 | tee "$out/package-contracts.log"
 "$python_bin" -m strata_ppu --prepare 2>&1 | tee "$out/packages.log"
 

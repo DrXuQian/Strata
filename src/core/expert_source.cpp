@@ -4736,6 +4736,11 @@ bool FileExpertSource::pcie_layer(int64_t layer) const {
 // ================================ THE ADAPTER ================================
 
 bool ExpertDispatch::fetch_can(int64_t layer) const {
+#ifdef STRATA_QUACTLIZE
+    // PCIe misses contain raw GGUF bytes; packed slots must be filled through
+    // the adaptive tier's GPU source, which supplies the offline gate/up pack.
+    if (strata::ppu::offline::layer((int) layer)) return false;
+#endif
     return fetch_admit > 0 && res_mut != nullptr && !usage.empty() && plan != nullptr && plan->pcie_mode == 2 &&
            plan->dst2 != nullptr && peer == nullptr && remote_count == 0 && fs == nullptr && pcie_num > 0 &&
            src != nullptr && src->pcie_layer(layer);
