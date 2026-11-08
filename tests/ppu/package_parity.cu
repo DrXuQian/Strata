@@ -27,10 +27,18 @@ template<class T> struct Device {
 };
 void near(const std::vector<float>& got, const std::vector<float>& want, float atol, float rtol) {
     if (got.size() != want.size()) throw std::runtime_error("size mismatch");
-    for (size_t i = 0; i < got.size(); ++i)
+    double worst = 0, margin = 0;
+    for (size_t i = 0; i < got.size(); ++i) {
         if (!std::isfinite(got[i]) || std::abs(got[i] - want[i]) > atol + rtol * std::abs(want[i]))
             throw std::runtime_error("numerical mismatch at " + std::to_string(i) + ": " +
                 std::to_string(got[i]) + " vs " + std::to_string(want[i]));
+        // Reported only; the float comparison above alone decides PASS/FAIL.
+        const double d = std::abs(double(got[i]) - double(want[i]));
+        worst = std::max(worst, d);
+        margin = std::max(margin, d / (double(atol) + double(rtol) * std::abs(double(want[i]))));
+    }
+    std::printf("near n=%zu max_abs_err=%.6g worst_err/bound=%.4f (atol=%g rtol=%g)\n",
+                got.size(), worst, margin, double(atol), double(rtol));
 }
 float value(size_t i) { return float(int((i * 17 + i / 7) % 101) - 50) / 256.0f; }
 float bf(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
