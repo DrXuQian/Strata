@@ -23,7 +23,6 @@ cmake -S . -B build-ppu \
   -DCMAKE_CUDA_COMPILER="$PPU_SDK/CUDA_SDK/bin/nvcc" \
   -DCUDAToolkit_ROOT="$PPU_SDK/CUDA_SDK" \
   -DCMAKE_CUDA_ARCHITECTURES=80 \
-  -DSTRATA_GGML_DIR=/path/to/llama.cpp \
   -DSTRATA_BUILD_TESTS=OFF \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build-ppu --target strata ncp_parity -j 3
@@ -32,6 +31,12 @@ cmake --build build-ppu --target strata ncp_parity -j 3
 `STRATA_GGML_DIR` supplies ggml's CPU expert implementation. Omitting it fetches
 Strata's pinned llama.cpp. This does not link llama.cpp's CUDA backend or its
 private kernel implementations into Strata.
+
+The box script's `LLAMA_CPP_DIR` is also optional. Leave it unset to fetch that
+pinned source; set it to an existing checkout for an offline build or to reuse
+local CPU ggml sources. The engine links ggml statically and needs no llama.cpp
+checkout or executable at runtime. NCP and quactlize use their shared libraries
+directly.
 
 Place these files beside `build-ppu/strata` (and beside `ncp_parity` for tests),
 or provide their directory through `LD_LIBRARY_PATH`:
@@ -201,7 +206,6 @@ missing device/library or failed fixture stops the command:
 ```sh
 PPU_SDK=/path/to/PPU_SDK \
 NCP_LIB_DIR=/path/to/shared/ncp-libs \
-LLAMA_CPP_DIR=/path/to/llama.cpp \
 PPU_CUDA_ARCH=80 \
 bash tools/ppu/check.sh
 ```
@@ -214,7 +218,6 @@ exercise chunked prefill, and the GGUF shard that contains the PLE table:
 ```sh
 PPU_SDK=/path/to/PPU_SDK \
 NCP_LIB_DIR=/path/to/shared/ncp-libs \
-LLAMA_CPP_DIR=/path/to/llama.cpp \
 PPU_CUDA_ARCH=80 \
 bash tools/ppu/check.sh -- \
   --pack /path/to/strata-pack \
@@ -272,7 +275,6 @@ To include quactlize, use the existing libraries on the box:
 ```sh
 PPU_SDK=/path/to/PPU_SDK \
 NCP_LIB_DIR=/path/to/shared/ncp-libs \
-LLAMA_CPP_DIR=/path/to/llama.cpp \
 PPU_CUDA_ARCH=80 \
 WITH_QUACTLIZE=1 \
 QUACTLIZE_PPU_BUNDLE=/path/to/quactlize/producer-directory \

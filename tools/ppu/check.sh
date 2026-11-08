@@ -5,8 +5,11 @@ set -euo pipefail
 
 : "${PPU_SDK:?Set PPU_SDK to the complete PPU SDK root}"
 : "${NCP_LIB_DIR:?Set NCP_LIB_DIR to the existing libncp_fa/moe/gdn.so directory}"
-: "${LLAMA_CPP_DIR:?Set LLAMA_CPP_DIR to the llama.cpp checkout for CPU ggml}"
 : "${PPU_CUDA_ARCH:?Set PPU_CUDA_ARCH to the explicit CUDA target supported by your PPU SDK}"
+
+# Optional local CPU ggml source. An empty value selects Strata's pinned
+# FetchContent dependency and clears a local path cached by an earlier build.
+ggml_dir=${LLAMA_CPP_DIR:-}
 
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 build=${BUILD_DIR:-"$repo/build-ppu"}
@@ -60,6 +63,7 @@ fi
     printf 'model_args:'
     printf ' %q' "$@"
     printf '\n'
+    printf 'cpu_ggml_source: %s\n' "${ggml_dir:-Strata pinned upstream (CMake FetchContent)}"
     "$PPU_SDK/CUDA_SDK/bin/nvcc" --version
     sha256sum "$NCP_LIB_DIR/libncp_fa.so" "$NCP_LIB_DIR/libncp_moe.so" "$NCP_LIB_DIR/libncp_gdn.so"
 } > "$out/provenance.txt"
@@ -70,7 +74,7 @@ fi
     -DCMAKE_CUDA_COMPILER="$PPU_SDK/CUDA_SDK/bin/nvcc" \
     -DCUDAToolkit_ROOT="$PPU_SDK/CUDA_SDK" \
     -DCMAKE_CUDA_ARCHITECTURES="$PPU_CUDA_ARCH" \
-    -DSTRATA_GGML_DIR="$LLAMA_CPP_DIR" \
+    -DSTRATA_GGML_DIR="$ggml_dir" \
     -DSTRATA_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release 2>&1 | tee "$out/configure.log"
 "$cmake_bin" --build "$build" --target "${targets[@]}" -j "${JOBS:-3}" 2>&1 | tee "$out/build.log"
 sha256sum "$build/strata" "$build/ncp_parity" >> "$out/provenance.txt"
