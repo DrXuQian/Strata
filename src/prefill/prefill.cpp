@@ -1,5 +1,13 @@
+// CPU prompt sharing must keep the original source when GPU staging reads K-pack.
+#ifdef STRATA_QUACTLIZE
+#define STRATA_PREFILL_CPU_SRC m.raw_src
+#else
+#define STRATA_PREFILL_CPU_SRC m.src
+#endif
 #ifdef STRATA_QUACTLIZE
 #include "strata/ppu/quactlize.hpp"
+#include "strata/ppu/offline.hpp"
+#include "strata/ppu/offline_experts.hpp"
 #include <climits>
 #endif
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
@@ -119,6 +127,18 @@ bool ple_batch_enabled() {
 #include <thread>
 #include <utility>
 #include <vector>
+
+#ifdef STRATA_QUACTLIZE
+namespace {
+bool offline_gu(const void* w,int type,int n,int k,const void* x,int rows,float* y,void* stream,int layer) {
+    const bool packed=strata::ppu::offline::layer(layer);
+    const bool used=strata::ppu::quactlize::dense(w,type,n,k,x,strata::ppu::quactlize::Input::f16,
+        rows,y,stream,0,0,0,true,packed);
+    if(packed&&!used)throw std::runtime_error("quactlize: offline prefill scratch unavailable");
+    return used;
+}
+}
+#endif
 
 #ifndef STRATA_PREFILL_MMQ
 // A build without the llama.cpp sources (no STRATA_NATIVE_EXPERTS): no MMQ, the FP16 expert path everywhere.
@@ -1122,6 +1142,10 @@ struct PrefillWarmer {
 };
 
 struct Prefill::Impl {
+#ifdef STRATA_QUACTLIZE
+    std::unique_ptr<core::ExpertSource> offline_src;
+    core::ExpertSource* raw_src = nullptr;
+#endif
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
     core::SessionState* ss = nullptr;
@@ -1539,6 +1563,9 @@ const MmqPlan& mmq_plan() {
             if (mf) ++mf_layers[std::string(path) + "|" + why + "|gate_up " + strata::ggml_type_name((uint32_t) gt) + ", down " + strata::ggml_type_name((uint32_t) dt)];
         };
         for (int64_t l = 0; on && l < layers; ++l) {
+#ifdef STRATA_QUACTLIZE
+            if (strata::ppu::offline::layer((int) l)) { p.fallback = true; continue; }
+#endif
             const int gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42, dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
             // #420: a tile on every GPU for these shapes (gate+up: 1280 rows, down: N rows), else the FP16 path
             if (!mmq::fits(gt, 1280) || !mmq::fits(dt, N)) {
@@ -1814,6 +1841,11 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     return strata::metal_engine::window_ensure(g, ss, ss.qsa_states[ss.qsa_primary()].max_cells, err);
 #endif
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
+#ifdef STRATA_QUACTLIZE
+    m.raw_src = src;
+    m.offline_src = strata::ppu::offline::gpu_source(src);
+    if (m.offline_src) { m.src = m.offline_src.get(); src = m.src; }
+#endif
     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
         err = "prefill: geometry differs from the artifact's"; return false;
@@ -5025,7 +5057,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 ++nstream;
                                 // a blob the CPU reads from RAM: page-locked, or any other that is not assembled into a
                                 // short-lived buffer (the arena's unpinned part, the mapped experts.bin's pages)
-                                if (c <= strata::kernels::cpu::MAXT && (m.src->pinned(l, e) || !m.src->transient(l, e)))
+                                if (c <= strata::kernels::cpu::MAXT && (STRATA_PREFILL_CPU_SRC->pinned(l, e) || !STRATA_PREFILL_CPU_SRC->transient(l, e)))
                                     cand.emplace_back(c, e);
                             }
                             std::sort(cand.begin(), cand.end());
@@ -5037,7 +5069,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             // here, and an expert without a stable blob stays on the GPU.
                             for (size_t i = 0; i < cand.size() && n_cpu < (int64_t) take; ++i) {
                                 const int32_t e = cand[i].second;
-                                const uint8_t* b = m.src->blob_stable(l, e);
+                                const uint8_t* b = STRATA_PREFILL_CPU_SRC->blob_stable(l, e);
                                 if (b == nullptr) continue;
                                 if (on_cpu.empty()) {
                                     on_cpu.assign((size_t) m.g->n_expert, 0);
@@ -6006,9 +6038,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const auto& f = lay.fmt[(size_t) l];
                                 const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
                                 pt.mark(kPfGemmGU, cs);
-                                if (ne <= INT_MAX && strata::ppu::quactlize::dense(blob_dev, f.gu_type, 1280, (int) N,
-                                        m.Xs + o0 * N, strata::ppu::quactlize::Input::f16, (int) ne,
-                                        m.GU + o0 * 1280, m.cs, 0, 0, 0, true)) {
+                                if (ne <= INT_MAX && offline_gu(blob_dev, f.gu_type, 1280, (int) N, m.Xs + o0 * N, (int) ne,
+                                        m.GU + o0 * 1280, m.cs, (int) l)) {
                                     swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
                                     if (had_d) strata::kernels::hadamard_rows_f16(m.Hh + o0 * 640, ne, 640, had_block, had_sh, m.cs);
                                     pt.mark(kPfGemmD, cs);
@@ -7303,6 +7334,9 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                     dq = (dq + 1) % DQ;
                     if (lay.native) {
                         const auto& f = lay.fmt[(size_t) l];
+#ifdef STRATA_QUACTLIZE
+                        if (!strata::ppu::offline::layer((int) l))
+#endif
                         strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
                                                            m.dq_gu[dq], cs, nullptr);
                         strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[dq], cs,
@@ -7325,9 +7359,8 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                 pt.mark(kPfGemmGU, cs);
 #ifdef STRATA_QUACTLIZE
                 if (!(lay.native && nr <= INT_MAX && !lay.fmt[(size_t) l].tail_off &&
-                    strata::ppu::quactlize::dense(blob_dev, lay.fmt[(size_t) l].gu_type, 1280, (int) N,
-                        m.Xs + o * N, strata::ppu::quactlize::Input::f16, (int) nr, m.GU + o * 1280,
-                        m.cs, 0, 0, 0, true)))
+                    offline_gu(blob_dev, lay.fmt[(size_t) l].gu_type, 1280, (int) N,
+                        m.Xs + o * N, (int) nr, m.GU + o * 1280, m.cs, (int) l)))
 #endif
 #ifdef STRATA_NCP_MOE
                 if (!strata::ppu::expert_f16(m.Xs + o * N, m.dq_gu[dq], m.GU + o * 1280, nr, 1280, N, m.cs))

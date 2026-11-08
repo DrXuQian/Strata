@@ -2,6 +2,7 @@
 #include "strata/core/run_manifest.hpp"
 #ifdef STRATA_QUACTLIZE
 #include "strata/ppu/quactlize.hpp"
+#include "strata/ppu/offline.hpp"
 #endif
 #include <cstdlib>
 #include "strata/core/weights.hpp"
@@ -190,6 +191,9 @@ struct Pending {
     uint64_t bytes;
     DevicePtr data;
     DevicePtr packed;   // STRATA_Q8_PACKED=1 copy, or null
+#ifdef STRATA_QUACTLIZE
+    std::string name;
+#endif
 };
 }
 
@@ -297,6 +301,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
     if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
     try {
+#ifdef STRATA_QUACTLIZE
+        strata::ppu::offline::bind(shards);
+#endif
         std::vector<Pending> pending;
         std::set<std::string> seen;
         int max_in = 0;
@@ -440,7 +447,11 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     strata::core::manifest::instance().tensors("dense", strata::ggml_type_name((uint32_t) tensor.type), 1, bytes);
                     if (packed) strata::core::manifest::instance().tensors("dense_packed_copy", "Q8_0", 1, bytes);
                 }
-                pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data), std::move(packed)});
+                pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data), std::move(packed)
+#ifdef STRATA_QUACTLIZE
+                    , tensor.name
+#endif
+                });
             }
             if (strata::core::manifest::enabled()) {
                 const char* v = std::getenv("STRATA_HC_Q8");
@@ -567,7 +578,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             // Immutable only: mutable expert and prompt staging addresses must
             // never inherit a resident artifact from a previous occupant.
             const size_t qp = strata::ppu::quactlize::preload(item.ref->native_data, item.type,
-                (int) item.ref->ne1, (int) item.ref->ne0);
+                (int) item.ref->ne1, (int) item.ref->ne0, item.name.c_str());
             total += qp;
             allocated += alloc_bytes(qp);
 #endif

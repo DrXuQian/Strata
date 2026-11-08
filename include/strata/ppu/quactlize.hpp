@@ -20,6 +20,7 @@ struct Shape {
     quactlize_ppu_placed_arrangement_v2 arrangement{};
     quactlize_ppu_kpack_sizes_v1 sizes{};
 };
+static_assert(sizeof(Shape) == 72, "layout descriptor and sizes must have no padding");
 // Host-only admission by BOTH producer and consumer. No invented layout IDs.
 bool describe(const qkg_call_v1& call, Shape& shape);
 const qkg_config_v1& recipe();
@@ -27,14 +28,14 @@ const qkg_config_v1& recipe();
 enum class Input { f16, f32, q8_1 };
 // Immutable dense/head weights only. Original GGUF bytes remain valid for every
 // original reader. Additional packed storage is bounded and counted at startup.
-size_t preload(const void* raw, int type, int n, int k);
+size_t preload(const void* raw, int type, int n, int k, const char* name = nullptr);
 void release(const void* raw) noexcept;
 
 // False means no work submitted: the original path can run. Admitted launch
 // errors throw. Mutable expert/staging pointers are NEVER cached by address.
 bool dense(const void* raw, int type, int n, int k, const void* x, Input input,
            int rows, float* out, void* stream, int64_t ldx = 0,
-           int64_t ldy = 0, float beta = 0, bool interleaved_gu = false);
+           int64_t ldy = 0, float beta = 0, bool interleaved_gu = false, bool packed = false);
 
 // Device-driven expert routing; no ID readback. Eight weight slices at a time
 // bound scratch regardless of the number of groups. Gate/up blob rows are
@@ -42,5 +43,5 @@ bool dense(const void* raw, int type, int n, int k, const void* x, Input input,
 bool grouped(const unsigned long long* ptr, const int32_t* start, const int32_t* count,
              const int32_t* ent_tok, const int32_t* ent_dst, int cap_groups, int cap_entries,
              const void* x_q8_1, size_t weight_offset, int type, int n, int k,
-             float* out, float* up, void* stream);
+             float* out, float* up, void* stream, bool packed = false);
 } // namespace strata::ppu::quactlize

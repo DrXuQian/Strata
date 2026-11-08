@@ -1,3 +1,16 @@
+#ifdef STRATA_QUACTLIZE
+#include "strata/ppu/offline.hpp"
+#include "strata/ppu/offline_experts.hpp"
+#define STRATA_GPU_BLOB(S,L,E) strata::ppu::offline::gpu_blob(S,L,E)
+#define STRATA_OFFLINE_ACTIVE strata::ppu::offline::enabled()
+#define STRATA_OFFLINE_OR || STRATA_OFFLINE_ACTIVE
+#define STRATA_OFFLINE_AND !STRATA_OFFLINE_ACTIVE &&
+#else
+#define STRATA_GPU_BLOB(S,L,E) S->blob_stable(L,E)
+#define STRATA_OFFLINE_ACTIVE false
+#define STRATA_OFFLINE_OR
+#define STRATA_OFFLINE_AND
+#endif
 #include "strata/core/logit_bias.hpp"
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
@@ -567,6 +580,11 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
         const SwapHome home = locate(s.layer);
         const strata::core::OnDevice on(home.dev);
         nib::guard_raw(s.layer, "the adaptive tier's copy back (resident_stage_swaps)");
+#ifdef STRATA_QUACTLIZE
+        if (strata::ppu::offline::layer(s.layer)) {
+            if (!src.copy_blob(s.layer,s.out,src.exchange_buffer(q,s.layer))) return false;
+        } else
+#endif
         if (const cudaError_t e = cudaMemcpyAsync(src.exchange_buffer(q, s.layer), home.cache->device_slot(slot),
                             (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer), cudaMemcpyDeviceToHost,
                             home.stream); e != cudaSuccess) {
@@ -4133,6 +4151,16 @@ int main(int argc, char** argv) {
     }
     const bool remote_caches = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 ||
                                o.expert_cache_remote[2] > 0;
+#ifdef STRATA_QUACTLIZE
+    if (STRATA_OFFLINE_ACTIVE) {
+        int visible = 0;
+        if (cudaGetDeviceCount(&visible) != cudaSuccess || visible != 1 || multi_gpu || remote_caches ||
+            o.peer_device >= 1 || o.native_preset.empty()) {
+            std::fprintf(stderr, "strata: offline quactlize requires --native and one visible GPU; use --gpu 0 without peer/remote caches\n");
+            return 2;
+        }
+    }
+#endif
     // A layer split keeps the resident RAM mode: every stage's GPU cache is left out of the RAM copy, and an adaptive
     // swap copies an evicted expert back from the card that owns its layer (resident_stage_swaps).
     // The helper-GPU caches are allowed beside the resident RAM mode too: their experts are left out of the RAM copy
@@ -4351,6 +4379,9 @@ int main(int argc, char** argv) {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native).  A missing shard is an error
             // here: it used to be skipped, leaving a model with some tensors absent and a later error, or none.
             o.native_shards = strata::gguf_split_paths(o.native_preset);
+#ifdef STRATA_QUACTLIZE
+            strata::ppu::offline::bind(o.native_shards);
+#endif
             // a model family Strata recognises but has no engine path for yet (Qwen3.6-35B-A3B) is refused here,
             // with a message that says so, before anything else about the file is judged
             {
@@ -8404,7 +8435,7 @@ int main(int argc, char** argv) {
                 if (per_layer) continue;
                 break;
             }
-            const uint8_t* b = srcp->blob_stable(profile[(size_t) i].first, profile[(size_t) i].second);
+            const uint8_t* b = STRATA_GPU_BLOB(srcp, profile[(size_t) i].first, profile[(size_t) i].second);
             const bool nib_pair = nib_x.active() && nib::layer(profile[(size_t) i].first).on;   // STRATA_EXPERT_NIBBLE
             if (b == nullptr || !(nib_pair ? nib_x.add(profile[(size_t) i].first, profile[(size_t) i].second, slot, b, err)
                                            : xcache.fill_slot_blocking(slot, b, err,
@@ -8427,7 +8458,7 @@ int main(int argc, char** argv) {
         // (STRATA_EXPERT_NIBBLE: a converted slot holds 4-bit codes, not the blob's bytes - the 4-bit check below is its check)
         if (prefilled > 0 && !nib::layer(profile[0].first).on &&
             !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
-                                srcp->blob_stable(profile[0].first, profile[0].second), err,
+                                STRATA_GPU_BLOB(srcp, profile[0].first, profile[0].second), err,
                                 (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
@@ -8437,7 +8468,7 @@ int main(int argc, char** argv) {
             // rebuilt GGUF block of every converted slot was already checked on the device
             size_t c = 0;
             while (c < (size_t) want && !nib::layer(profile[c].first).on) ++c;
-            if (!nib_x.check(profile[c].first, profile[c].second, srcp->blob_stable(profile[c].first, profile[c].second),
+            if (!nib_x.check(profile[c].first, profile[c].second, STRATA_GPU_BLOB(srcp, profile[c].first, profile[c].second),
                              err)) {
                 std::fprintf(stderr, "strata generate: STRATA_EXPERT_NIBBLE: CUDA0: %s\n", err.c_str());
                 return 1;
@@ -8572,7 +8603,7 @@ int main(int argc, char** argv) {
             if (filled >= st.cache.slots()) break;
             const int32_t slot = st.cache.admit(pr.first, pr.second);
             if (slot == strata::core::kNotResident) break;
-            const uint8_t* b = srcp->blob_stable(pr.first, pr.second);
+            const uint8_t* b = STRATA_GPU_BLOB(srcp, pr.first, pr.second);
             const bool nib_pair = nib_c.active() && nib::layer(pr.first).on;   // STRATA_EXPERT_NIBBLE
             if (b == nullptr || !(nib_pair ? nib_c.add(pr.first, pr.second, slot, b, err)
                                            : st.cache.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(pr.first)))) {
@@ -8589,7 +8620,7 @@ int main(int argc, char** argv) {
         // (STRATA_EXPERT_NIBBLE: a converted slot holds 4-bit codes, not the blob's bytes - the 4-bit check below is its check)
         if (filled == 0 || (!nib::layer(st.profile[0].first).on &&
                             !st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),
-                                                  srcp->blob_stable(st.profile[0].first, st.profile[0].second), err,
+                                                  STRATA_GPU_BLOB(srcp, st.profile[0].first, st.profile[0].second), err,
                                                   (int64_t) lay.blob_bytes(st.profile[0].first)))) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d expert cache: %s\n", st.dev,
                          filled == 0 ? "nothing filled" : err.c_str());
@@ -8599,7 +8630,7 @@ int main(int argc, char** argv) {
             size_t c = 0;
             while (c < st.profile.size() && !nib::layer(st.profile[c].first).on) ++c;
             const auto& pc = st.profile[c];
-            if (!nib_c.check(pc.first, pc.second, srcp->blob_stable(pc.first, pc.second), err)) {
+            if (!nib_c.check(pc.first, pc.second, STRATA_GPU_BLOB(srcp, pc.first, pc.second), err)) {
                 std::fprintf(stderr, "strata generate: STRATA_EXPERT_NIBBLE: CUDA%d: %s\n", st.dev, err.c_str());
                 return 1;
             }
@@ -10193,7 +10224,7 @@ int main(int argc, char** argv) {
                 const int32_t l = profile[pi].first, e = profile[pi].second;
                 const size_t i = (size_t) l * (size_t) g.n_expert + (size_t) e;
                 if (host_res[i] >= 0 || lay.blob_bytes(l) > room) continue;
-                const uint8_t* b = srcp->blob_stable(l, e);
+                const uint8_t* b = STRATA_GPU_BLOB(srcp, l, e);
                 if (b == nullptr) continue;
                 nib::guard_raw(l, "the elastic K/V's refill (kvg_trim)");
                 cudaMemcpyAsync(xcache.device_slot((int32_t) s), b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice,
@@ -13102,7 +13133,7 @@ int main(int argc, char** argv) {
             if (pin_blobs_on()) {   // lock the batch's source pages (a file-backed arena on AMD; see pin_blobs)
                 std::vector<std::pair<uintptr_t, uintptr_t>> spans;
                 for (const Swap& s : swaps)
-                    if (const uint8_t* b = srcp->blob_stable(s.layer, s.in))
+                    if (const uint8_t* b = STRATA_GPU_BLOB(srcp, s.layer, s.in))
                         spans.emplace_back((uintptr_t) b,
                                            (uintptr_t) b + strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
                 pin_blobs(std::move(spans), pin_live);
@@ -13123,7 +13154,7 @@ int main(int argc, char** argv) {
             }
             bool main_live = false;
             // STRATA_DMA_BATCH (F12): the main device's copies as one cudaMemcpyBatchAsync (mode 0: one each)
-            const int dma_mode = multi_gpu ? 0 : strata::core::dma_batch_mode();
+            const int dma_mode = multi_gpu STRATA_OFFLINE_OR ? 0 : strata::core::dma_batch_mode();
             std::vector<void*> cp_dst;
             std::vector<const void*> cp_src;
             std::vector<size_t> cp_bytes;
@@ -13138,7 +13169,7 @@ int main(int argc, char** argv) {
                 }
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = fenced_slots.empty() ? host_res[out] : fenced_slots[si];
-                const uint8_t* b = srcp->blob_stable(s.layer, s.in);
+                const uint8_t* b = STRATA_GPU_BLOB(srcp, s.layer, s.in);
                 nib::guard_raw(s.layer, "the adaptive tier's copy in");
                 const int stn = multi_gpu ? stage_of(s.layer) : 0;   // the swap stays in the layer's own cache
                 GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
@@ -13377,6 +13408,11 @@ int main(int argc, char** argv) {
                 for (const ASwap& w : aswaps) {
                     if (w.home != hi || !w.exchange) continue;
                     nib::guard_raw(w.layer, "the async adaptive tier's copy back (a_back)");
+#ifdef STRATA_QUACTLIZE
+                    if (strata::ppu::offline::layer(w.layer)) {
+                        if (!src.copy_blob(w.layer,w.out,src.exchange_buffer(w.j,w.layer))) a_err=true;
+                    } else
+#endif
                     if (const cudaError_t e = cudaMemcpyAsync(src.exchange_buffer(w.j, w.layer), h.cache->device_slot(w.slot),
                                                               (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer),
                                                               cudaMemcpyDeviceToHost, h.stream); e != cudaSuccess) {
@@ -13390,6 +13426,9 @@ int main(int argc, char** argv) {
             if (any) a_mark(h);
         };
         auto a_from = [&](const ASwap& w) -> const uint8_t* {   // step 2: where `in` is copied from (host work)
+#ifdef STRATA_QUACTLIZE
+            if (strata::ppu::offline::layer(w.layer)) return strata::ppu::offline::gpu_blob(nullptr,w.layer,w.in);
+#endif
             if (a_arena) {   // the arena's blob, pinned or not (a pageable one blocks the job thread, not the host)
                 const uint8_t* b = arena_src.blob_at(w.layer, w.in);   // (blob() counts reads_: not from this thread)
                 if (b == nullptr) {
@@ -14144,7 +14183,7 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (pick < 0) continue;
-                    const uint8_t* b = srcp->blob_stable(layer, pick % g.n_expert);
+                    const uint8_t* b = STRATA_GPU_BLOB(srcp, layer, pick % g.n_expert);
                     if (b == nullptr || !xcache.fill_slot_queued(slot, b, ferr,
                             (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
                         e = "VRAM: refilling the cache failed: " + ferr;
@@ -16947,13 +16986,13 @@ int main(int argc, char** argv) {
                 const strata::core::OnDevice on(p.dev);
                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
                     strata::core::BlobPart parts[3];
-                    const int np = refill_parts && !refill_blocking() ? srcp->blob_parts(i / g.n_expert, i % g.n_expert, parts) : 0;
+                    const int np = STRATA_OFFLINE_AND refill_parts && !refill_blocking() ? srcp->blob_parts(i / g.n_expert, i % g.n_expert, parts) : 0;
                     if (np > 0) {   // the GGUF read in place: the tensors' pieces go from the mapping to the slot, no assembled copy
                         if (!p.cache->fill_slot_queued_parts(slot, parts, np, e)) return false;
                         host_res[(size_t) i] = slot;
                         continue;
                     }
-                    const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                    const uint8_t* b = STRATA_GPU_BLOB(srcp, i / g.n_expert, i % g.n_expert);
                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                     if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
                                                             : p.cache->fill_slot_queued(slot, b, e, nb)))
@@ -20078,7 +20117,7 @@ int main(int argc, char** argv) {
         if (!lent.empty()) {
             const Clock::time_point tr = Clock::now();
             for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
-                const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                const uint8_t* b = STRATA_GPU_BLOB(srcp, i / g.n_expert, i % g.n_expert);
                 const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                 if (b == nullptr || !(refill_blocking() ? xcache.fill_slot_blocking(slot, b, err, nb)
                                                         : xcache.fill_slot_queued(slot, b, err, nb))) {
@@ -20623,20 +20662,24 @@ int main(int argc, char** argv) {
             if (pin_blobs_on()) {   // lock the batch's source pages (a file-backed arena on AMD; see pin_blobs)
                 std::vector<std::pair<uintptr_t, uintptr_t>> spans;
                 for (const Swap& s : swaps)
-                    if (const uint8_t* b = srcp->blob_stable(s.layer, s.in))
+                    if (const uint8_t* b = STRATA_GPU_BLOB(srcp, s.layer, s.in))
                         spans.emplace_back((uintptr_t) b,
                                            (uintptr_t) b + strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
                 pin_blobs(std::move(spans), pin_live);
             }
             // STRATA_DMA_BATCH (F12): the round's copies as one cudaMemcpyBatchAsync; mode 0 is the loop of one copy each
-            const int dma_mode = strata::core::dma_batch_mode();
+            const int dma_mode =
+#ifdef STRATA_QUACTLIZE
+                STRATA_OFFLINE_ACTIVE ? 0 :
+#endif
+                strata::core::dma_batch_mode();
             std::vector<void*> cp_dst;
             std::vector<const void*> cp_src;
             std::vector<size_t> cp_bytes;
             for (const Swap& s : swaps) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = host_res[out];
-                const uint8_t* b = srcp->blob_stable(s.layer, s.in);
+                const uint8_t* b = STRATA_GPU_BLOB(srcp, s.layer, s.in);
                 nib::guard_raw(s.layer, "the adaptive refill's copy in");
                 const size_t blob_n = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer);
                 // asynchronous: the copies run while the MTP drafts; the next window waits for them

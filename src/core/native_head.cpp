@@ -1,6 +1,7 @@
 #include "strata/core/native_head.hpp"
 #ifdef STRATA_QUACTLIZE
 #include "strata/ppu/quactlize.hpp"
+#include "strata/ppu/offline.hpp"
 #endif
 #include "strata/core/spill_gate.hpp"
 #include "strata/core/run_manifest.hpp"
@@ -43,6 +44,9 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         return false;
     }
     try {
+#ifdef STRATA_QUACTLIZE
+        strata::ppu::offline::bind(shards);
+#endif
         // The architecture is the metadata shard's; output.weight comes from whichever shard holds it (shard 2
         // of Unsloth's UD-Q4_K_XL, whose shard 1 holds no tensor).  GgufModel refuses a duplicate across shards.
         const strata::GgufModel model(shards);
@@ -112,7 +116,7 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         type_ = (int) tensor->type;
 #ifdef STRATA_QUACTLIZE
         if (strata::ppu::quactlize::enabled()) {
-            if (!host_) strata::ppu::quactlize::preload(weights_, type_, n_out_, n_in_);
+            if (!host_) strata::ppu::quactlize::preload(weights_, type_, n_out_, n_in_, "output.weight");
             return true; // The original GGUF copy must not be repacked in place.
         }
 #endif
