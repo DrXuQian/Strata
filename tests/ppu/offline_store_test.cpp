@@ -4,6 +4,11 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+// Container tests exercise parsing/mapping only, independently of packages.
+namespace strata::ppu::quactlize {
+bool enabled() { return false; }
+bool describe(const Call&,Shape&) { throw std::runtime_error("unexpected package access"); }
+}
 namespace off = strata::ppu::offline;
 int main(int argc, char** argv) {
     if (argc != 4) return 2;

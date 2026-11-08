@@ -23,7 +23,7 @@ def main():
     driver = build / "offline_store_test"
     subprocess.run([os.environ.get("CXX", "c++"), "-std=c++17", "-I", str(repo / "include"),
                     str(repo / "tests/ppu/offline_store_test.cpp"), str(repo / "src/ppu/offline.cpp"),
-                    str(repo / "src/ppu/quactlize.cpp"), "-ldl", "-pthread", "-o", str(driver)], check=True)
+                    "-pthread", "-o", str(driver)], check=True)
     source = build / "source.gguf"
     source.write_bytes(b"source identity fixture")
     stat = source.stat()

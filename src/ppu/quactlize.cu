@@ -1,5 +1,6 @@
 #include "strata/ppu/quactlize.hpp"
 #include "strata/ppu/offline.hpp"
+#include "strata/ppu/python.hpp"
 #include "strata/core/dispatch_stats.hpp"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -20,9 +21,6 @@ namespace {
 void check(cudaError_t rc) {
     if (rc != cudaSuccess) throw std::runtime_error(std::string("quactlize: ") + cudaGetErrorString(rc));
 }
-void launch(int rc, const char* op) {
-    if (rc) throw std::runtime_error(std::string("quactlize: ") + op + " failed, status " + std::to_string(rc));
-}
 size_t align(size_t n) {
     if (n > SIZE_MAX - 255) throw std::overflow_error("quactlize: allocation overflow");
     return (n + 255) & ~size_t(255);
@@ -37,31 +35,32 @@ size_t budget(const char* name) {
     return size_t(mb) << 20;
 }
 int device() { int d; check(cudaGetDevice(&d)); return d; }
+bool capturing(void* stream) {
+    cudaStreamCaptureStatus state;
+    check(cudaStreamIsCapturing(static_cast<cudaStream_t>(stream), &state));
+    return state != cudaStreamCaptureStatusNone;
+}
 bool may_load(void* stream) {
     if (loaded()) return true;
     cudaStreamCaptureStatus state;
     check(cudaStreamIsCapturing(static_cast<cudaStream_t>(stream), &state));
     return state == cudaStreamCaptureStatusNone; // No first-time DSO/runtime initialization during capture.
 }
-qkg_call_v1 call(int type, int n, int k, int rows, int experts = 1) {
-    qkg_call_v1 c{};
-    c.version = 1; c.size = sizeof(c);
+Call call(int type, int n, int k, int rows, int experts = 1) {
+    Call c{};
     c.qtype = type; c.n = n; c.k = k; c.experts = experts; c.rows = rows;
-    c.mode = experts == 1 ? QKG_DENSE : QKG_INDEXED;
-    c.input_type = QKG_F32; c.channels = 1; c.topk = 1;
-    c.a_row_stride = k; c.a_token_stride = k; c.ids_stride = 1; c.out_row_stride = n;
+    c.input_type = F32;
+    c.a_row_stride = k; c.out_row_stride = n;
     return c;
 }
-void planes(qkg_call_v1& c, void* p, const Shape& s) {
+void planes(Call& c, void* p, const Shape& s) {
     c.low = static_cast<uint8_t*>(p);
     c.high = s.sizes.high_bytes ? c.low + s.sizes.low_bytes : nullptr;
     c.units = c.low + s.sizes.low_bytes + s.sizes.high_bytes;
 }
-void pack(const void* raw, const qkg_call_v1& c, const Shape& s) {
+void pack(const void* raw, const Call& c, const Shape& s) {
     if (offline::enabled()) throw std::runtime_error("quactlize: runtime shuffle is forbidden in offline mode");
-    launch(library().pack(static_cast<const uint8_t*>(raw), const_cast<uint8_t*>(c.low),
-        const_cast<uint8_t*>(c.high), const_cast<uint8_t*>(c.units), c.n, c.k, c.experts,
-        c.qtype, &s.arrangement, c.stream), "online shuffle");
+    package_pack(raw,c,s,device());
 }
 struct Artifact {
     int type, n, k;
@@ -215,9 +214,13 @@ unsigned blocks(size_t elems) { return static_cast<unsigned>((elems + 255) / 256
 
 size_t preload(const void* raw, int type, int n, int k, const char* name) {
     if (!enabled() || !raw) return 0;
-    qkg_call_v1 c = call(type, n, k, 1);
+    Call c = call(type, n, k, 1);
     Shape shape;
     if (!describe(c, shape)) return 0;
+    // The verifier can capture without an eager grouped call. Prepare every
+    // supported format before that point, including formats only in experts.
+    // Python retains a per-device once flag; no repeated allocation or JIT.
+    python::call("prepare_quact",{},{},device(),nullptr);
     const offline::Record* disk=nullptr;
     if (offline::enabled()) {
         disk=name?offline::store().dense(name):nullptr;
@@ -275,9 +278,10 @@ bool dense(const void* raw, int type, int n, int k, const void* x, Input input,
     if (ldy <= 0) ldy = n;
     if (ldx < k || ldy < n || (input == Input::q8_1 && (ldx != k || k % 32)) || (interleaved && n % 2)) return false;
     if (!may_load(stream)) return false;
-    qkg_call_v1 c = call(type, n, k, rows);
-    c.input_type = input == Input::f16 ? QKG_F16 : QKG_F32;
-    c.a_row_stride = ldx; c.a_token_stride = ldx;
+    Call c = call(type, n, k, rows);
+    c.capturing=capturing(stream);
+    c.input_type = input == Input::f16 ? F16 : F32;
+    c.a_row_stride = ldx;
     const bool in_place = packed_input && interleaved && beta == 0 && n <= 4096;
     const bool finish_output = beta != 0 || (interleaved && !in_place);
     c.out_row_stride = finish_output ? n : ldy;
@@ -311,7 +315,7 @@ bool dense(const void* raw, int type, int n, int k, const void* x, Input input,
         check(cudaStreamWaitEvent(cs, a->ready, state == cudaStreamCaptureStatusNone ? 0 : cudaEventWaitExternal));
     } else if(!packed_input)pack(raw, c, shape);
     if (xf) expand_q81<<<blocks(nx), 256, 0, cs>>>(static_cast<const Q81*>(x), xf, k, rows);
-    launch(library().run(&c, &recipe(), &shape.arrangement), "GEMV");
+    package_run(c,shape,device());
     if (in_place) interleave_rows<<<rows, 256, n * sizeof(float), cs>>>(out, n, ldy);
     if (finish_output) finish<<<blocks(ny), 256, 0, cs>>>(c.output, out, n, rows, ldy, beta, interleaved);
     check(cudaPeekAtLastError());
@@ -328,6 +332,7 @@ bool grouped(const unsigned long long* ptr, const int32_t* start, const int32_t*
     if(offline::enabled()&&!packed_input)return false;
     if (!may_load(stream)) return false;
     auto c = call(type, n, k, cap_entries, kGroupBatch);
+    c.capturing=capturing(stream);
     Shape shape;
     if (!describe(c, shape)) return false;
     const size_t nx = size_t(cap_entries) * k, ny = size_t(cap_entries) * n;
@@ -359,7 +364,7 @@ bool grouped(const unsigned long long* ptr, const int32_t* start, const int32_t*
         }
         gather_x<<<blocks(nx), 256, 0, cs>>>(static_cast<const Q81*>(x_q8_1), ent_tok, group,
             const_cast<float*>(static_cast<const float*>(c.a)), ids, cap_entries, k, batch);
-        launch(library().run(&c, &recipe(), &shape.arrangement), "indexed GEMV");
+        package_run(c,shape,device());
         scatter_group<<<blocks(ny), 256, 0, cs>>>(c.output, group, ent_dst, out, up, cap_entries, n, batch);
     }
     check(cudaPeekAtLastError());

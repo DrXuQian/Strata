@@ -1,29 +1,34 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
-#include "strata/ppu/quactlize/quactlize_ppu_pack.h"
-#include "strata/ppu/quactlize/kpack_execution.h"
 
 namespace strata::ppu::quactlize {
-// ABI copied from the user's llama.cpp; these functions load existing DSOs.
-struct Library {
-    decltype(&quactlize_ppu_kpack_canonical_arrangement_v1) arrangement = nullptr;
-    decltype(&quactlize_ppu_kpack_sizes_for_arrangement_v1) sizes = nullptr;
-    decltype(&quactlize_ppu_prepare_fully_quantized_dev_for_arrangement_v2) pack = nullptr;
-    decltype(&quactlize_kpack_gemv_query_v1) query = nullptr;
-    decltype(&quactlize_kpack_gemv_run_v1) run = nullptr;
-};
 bool enabled();
 bool loaded();
-const Library& library(); // Explicit opt-in + broken/missing library throws.
-struct Shape {
-    quactlize_ppu_placed_arrangement_v2 arrangement{};
-    quactlize_ppu_kpack_sizes_v1 sizes{};
+// Serialized Strata container metadata. Values come from the installed
+// package's canonical producer, not a copied operator ABI header.
+struct Arrangement {
+    int32_t version=0, layout=0, bits=0, high_bits=0, artifact_tile_k=0;
+    int32_t transport_tile_k=0, group_size=0, reserved=0;
+    uint64_t mapping_id=0;
 };
-static_assert(sizeof(Shape) == 72, "layout descriptor and sizes must have no padding");
-// Host-only admission by BOTH producer and consumer. No invented layout IDs.
-bool describe(const qkg_call_v1& call, Shape& shape);
-const qkg_config_v1& recipe();
+struct Sizes { uint64_t raw_bytes=0, low_bytes=0, high_bytes=0, units_bytes=0; };
+struct Shape { Arrangement arrangement{}; Sizes sizes{}; };
+static_assert(sizeof(Shape)==72, "offline container descriptor size");
+inline constexpr int F32=0, F16=1;
+struct Call {
+    int qtype=0,n=0,k=0,experts=1,rows=1,input_type=F32;
+    int64_t a_row_stride=0,out_row_stride=0;
+    const void* a=nullptr;
+    const uint8_t *low=nullptr,*high=nullptr,*units=nullptr;
+    const int32_t* ids=nullptr;
+    float* output=nullptr;
+    void* stream=nullptr;
+    bool capturing=false;
+};
+bool describe(const Call& call, Shape& shape);
+void package_pack(const void* raw,const Call& call,const Shape& shape,int device);
+void package_run(const Call& call,const Shape& shape,int device);
 
 enum class Input { f16, f32, q8_1 };
 // Immutable dense/head weights only. Original GGUF bytes remain valid for every

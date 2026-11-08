@@ -60,7 +60,7 @@
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_pattn.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
-#if defined(STRATA_NCP_FA) || defined(STRATA_NCP_MOE)
+#if defined(STRATA_PPU_FA) || defined(STRATA_PPU_MOE)
 #include "strata/ppu/kernels.hpp"
 #endif
 #include "strata/kernels/qsa_select.hpp"
@@ -4622,12 +4622,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // V dequantized from its q4_0 blocks to fp16 at gather)
                     static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
                     const int64_t ld_a = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
-#ifdef STRATA_NCP_FA
+#ifdef STRATA_PPU_FA
                     const bool ncp_attn = !old_attn && (st.kv_mode == 0 || staged) && !st.kv_rot && !st.kv_hybrid &&
                         strata::ppu::qsa_prefill(m.q, pools, m.sel_ids, m.steps_host.data(), m.cap, s, m.attn, T, cs);
 #endif
                     const bool gated =
-#ifdef STRATA_NCP_FA
+#ifdef STRATA_PPU_FA
                         !ncp_attn &&
 #endif
                         !old_attn && !st.kv_rot && !st.kv_hybrid && qsa_fuse_gate() &&
@@ -4644,7 +4644,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // STRATA_PATTN_SM60=1 (qsa_pattn.hpp, sm_6x, int8 K/V): the decode kernels' output bit for bit from a
                     // score kernel and a value kernel that merges as it folds (no partials, no merge kernel), ~100
                     // queries a batch in the same scratch; any refusal or launch failure runs the loop below
-#ifdef STRATA_NCP_FA
+#ifdef STRATA_PPU_FA
                     if (!ncp_attn)
 #endif
                     if (!gated && (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
@@ -6048,7 +6048,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                             m.Dm + o0 * N, m.cs)) {
                                         strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off,
                                             f.n_embd * f.n_ff, m.dq_d[q], m.cs, nullptr);
-#ifdef STRATA_NCP_MOE
+#ifdef STRATA_PPU_MOE
                                         if (!strata::ppu::expert_f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640, m.cs))
 #endif
                                         m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
@@ -6074,7 +6074,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (slot >= 0) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
                             const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
                             pt.mark(kPfGemmGU, cs);
-#ifdef STRATA_NCP_MOE
+#ifdef STRATA_PPU_MOE
                             if (!strata::ppu::expert_f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N, m.cs))
 #endif
                             m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
@@ -6089,7 +6089,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             // gate/up input (Xs above) is handled the same way.
                             if (had_d) strata::kernels::hadamard_rows_f16(m.Hh + o0 * 640, ne, 640, had_block, had_sh, m.cs);
                             pt.mark(kPfGemmD, cs);
-#ifdef STRATA_NCP_MOE
+#ifdef STRATA_PPU_MOE
                             if (!strata::ppu::expert_f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640, m.cs))
 #endif
                             m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
@@ -7362,7 +7362,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                     offline_gu(blob_dev, lay.fmt[(size_t) l].gu_type, 1280, (int) N,
                         m.Xs + o * N, (int) nr, m.GU + o * 1280, m.cs, (int) l)))
 #endif
-#ifdef STRATA_NCP_MOE
+#ifdef STRATA_PPU_MOE
                 if (!strata::ppu::expert_f16(m.Xs + o * N, m.dq_gu[dq], m.GU + o * 1280, nr, 1280, N, m.cs))
 #endif
                 m.gemm.f16(m.Xs + o * N, m.dq_gu[dq], m.GU + o * 1280, nr, 1280, N);
@@ -7374,7 +7374,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                         lay.fmt[(size_t) l].d_type, (int) N, 640, m.Hh + o * 640,
                         strata::ppu::quactlize::Input::f16, (int) nr, m.Dm + o * N, m.cs)))
 #endif
-#ifdef STRATA_NCP_MOE
+#ifdef STRATA_PPU_MOE
                 if (!strata::ppu::expert_f16(m.Hh + o * 640, m.dq_d[dq], m.Dm + o * N, nr, N, 640, m.cs))
 #endif
                 m.gemm.f16(m.Hh + o * 640, m.dq_d[dq], m.Dm + o * N, nr, N, 640);
@@ -7869,18 +7869,18 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                                                                            : core::qsa_attn_pools(st);
                         pt.mark(kPfQsaAttn, cs);
                         static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
-#ifdef STRATA_NCP_FA
+#ifdef STRATA_PPU_FA
                         const bool ncp_attn = !old_attn && (st.kv_mode == 0 || staged) && !st.kv_rot && !st.kv_hybrid &&
                             strata::ppu::qsa_prefill(m.q, pools, m.sel_ids, m.steps_host.data(), m.cap, s, m.attn, T, cs);
 #endif
                         const bool gated =
-#ifdef STRATA_NCP_FA
+#ifdef STRATA_PPU_FA
                             !ncp_attn &&
 #endif
                             !old_attn && !st.kv_rot && !st.kv_hybrid && qsa_fuse_gate() &&
                                            strata::kernels::qsa_prompt_attn_batch_gated(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
                                                                                         m.Qf, m.attn_h, ZV, T, cs);
-#ifdef STRATA_NCP_FA
+#ifdef STRATA_PPU_FA
                         if (!ncp_attn)
 #endif
                         if (!gated && (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,

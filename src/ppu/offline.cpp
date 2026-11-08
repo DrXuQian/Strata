@@ -150,8 +150,8 @@ const uint8_t* expert(int l,int e,int type,int down,int n,int ff,size_t bytes) {
     if (!r || r->type != type || r->down_type != down || r->k != n || r->n != 2*ff || r->bytes != bytes)
         fail("expert geometry differs from runtime layer " + std::to_string(l));
     quactlize::Shape s;
-    qkg_call_v1 c{}; c.version=1;c.size=sizeof(c);c.qtype=type;c.n=2*ff;c.k=n;
-    c.experts=c.rows=c.channels=c.topk=1;c.a_row_stride=n;c.out_row_stride=2*ff;
+    quactlize::Call c{}; c.qtype=type;c.n=2*ff;c.k=n;
+    c.experts=c.rows=1;c.a_row_stride=n;c.out_row_stride=2*ff;
     if (!quactlize::describe(c,s) || std::memcmp(&s,&r->shape,sizeof(s))) fail("expert producer/consumer layout mismatch");
     return store().data(*r);
 }

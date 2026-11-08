@@ -1,4 +1,4 @@
-// Offline preparation on the box, using the existing shared GPU producer.
+// Offline preparation on the box, using the installed QUactlize Tensor/JIT producer.
 #include "strata/ppu/offline.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include <cuda_runtime.h>
@@ -30,15 +30,16 @@ struct Device {
         auto* lo=static_cast<uint8_t*>(packed);
         auto* hi=s.sizes.high_bytes?lo+s.sizes.low_bytes:nullptr;
         auto* units=lo+s.sizes.low_bytes+s.sizes.high_bytes;
-        int rc=qz::library().pack(static_cast<const uint8_t*>(raw),lo,hi,units,n,k,1,type,&s.arrangement,nullptr);
-        if(rc)throw std::runtime_error("GPU producer status "+std::to_string(rc));
+        qz::Call c{};c.qtype=type;c.n=n;c.k=k;c.low=lo;c.high=hi;c.units=units;
+        int device=0;ck(cudaGetDevice(&device));
+        qz::package_pack(raw,c,s,device);
         std::vector<uint8_t> result(s.sizes.raw_bytes);
         ck(cudaMemcpy(result.data(),packed,result.size(),cudaMemcpyDeviceToHost));return result;
     }
 };
 bool describe(int type,int n,int k,qz::Shape& s) {
-    qkg_call_v1 c{};c.version=1;c.size=sizeof(c);c.qtype=type;c.n=n;c.k=k;
-    c.experts=c.rows=c.channels=c.topk=1;c.a_row_stride=k;c.out_row_stride=n;
+    qz::Call c{};c.qtype=type;c.n=n;c.k=k;
+    c.experts=c.rows=1;c.a_row_stride=k;c.out_row_stride=n;
     return qz::describe(c,s);
 }
 bool raw_down_supported(int type) {
@@ -68,7 +69,6 @@ int main(int argc,char** argv) {
     try {
         setenv("STRATA_QUACTLIZE","1",1);
         int devices=0;ck(cudaGetDeviceCount(&devices));if(!devices)throw std::runtime_error("no PPU device");
-        qz::library();
         const auto paths=strata::gguf_split_paths(input);
         strata::GgufModel model(paths);
         std::vector<off::Source> sources;

@@ -1,90 +1,62 @@
 #include "strata/ppu/quactlize.hpp"
-#include <atomic>
+#include "strata/ppu/python.hpp"
 #include <cstdlib>
 #include <cstring>
-#include <dlfcn.h>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <stdexcept>
-#include <string>
+#include <tuple>
 
 namespace strata::ppu::quactlize {
 bool enabled() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_QUACTLIZE");
-        return v && std::strcmp(v, "1") == 0;
-    }();
+    static const bool on=[] {const char* v=std::getenv("STRATA_QUACTLIZE");return v&&std::strcmp(v,"1")==0;}();
     return on;
 }
+bool loaded(){return python::loaded();}
+bool describe(const Call& c,Shape& s) {
+    s={};
+    if(!enabled()||(c.qtype!=8&&(c.qtype<10||c.qtype>14))||c.n<=0||c.k<=0||c.experts<=0||c.rows<=0||
+       c.n%256||c.k%256||((c.qtype==11||c.qtype==14)&&c.k%512))return false;
+    using Key=std::tuple<int,int,int,int>;
+    static std::mutex mutex;
+    static std::map<Key,Shape> cache;
+    std::lock_guard<std::mutex> lock(mutex);
+    const Key key{c.qtype,c.n,c.k,c.experts};
+    if(auto it=cache.find(key);it!=cache.end()){s=it->second;return true;}
+    const auto values=python::call("quact_layout",{},{c.qtype,c.n,c.k,c.experts},-1,nullptr,c.capturing);
+    if(values.size()!=13)throw std::runtime_error("quactlize: invalid package layout response");
+    int32_t* fields[]={&s.arrangement.version,&s.arrangement.layout,&s.arrangement.bits,&s.arrangement.high_bits,
+        &s.arrangement.artifact_tile_k,&s.arrangement.transport_tile_k,&s.arrangement.group_size,&s.arrangement.reserved};
+    for(size_t i=0;i<8;++i){
+        if(values[i]<0||values[i]>INT32_MAX)throw std::runtime_error("quactlize: descriptor exceeds int32");
+        *fields[i]=int32_t(values[i]);
+    }
+    s.arrangement.mapping_id=values[8];
+    for(size_t i=9;i<13;++i)if(values[i]<0)throw std::runtime_error("quactlize: negative plane size");
+    s.sizes={uint64_t(values[9]),uint64_t(values[10]),uint64_t(values[11]),uint64_t(values[12])};
+    const auto& b=s.sizes;
+    if(s.arrangement.version!=2||s.arrangement.reserved||!s.arrangement.mapping_id||!b.raw_bytes||
+       b.raw_bytes>SIZE_MAX||b.low_bytes>b.raw_bytes||b.high_bytes>b.raw_bytes-b.low_bytes||
+       b.units_bytes!=b.raw_bytes-b.low_bytes-b.high_bytes||(s.arrangement.high_bits==0)!=(b.high_bytes==0))
+        throw std::runtime_error("quactlize: invalid byte-neutral package layout");
+    cache.emplace(key,s);return true;
+}
 namespace {
-std::atomic<bool> is_loaded{false};
-std::string location(const char* override_name, const char* directory, const char* file) {
-    const char* p = override_name ? std::getenv(override_name) : nullptr;
-    if (p && *p) return p;
-    const char* root = std::getenv(directory);
-    return root && *root ? std::string(root) + "/" + file : file;
+using python::Dtype;
+using python::Tensor;
+Tensor bytes(const void* p,uint64_t n){return {p,Dtype::u8,{int64_t(n)}};}
 }
-void* open(const std::string& path) {
-    void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (!h) throw std::runtime_error("quactlize: " + path + ": " + dlerror());
-    return h; // Function pointers/captured graphs retain the DSO for process life.
+void package_pack(const void* raw,const Call& c,const Shape& s,int device) {
+    python::call("quact_pack",{bytes(raw,s.sizes.raw_bytes),bytes(c.low,s.sizes.low_bytes),
+        bytes(c.high,s.sizes.high_bytes),bytes(c.units,s.sizes.units_bytes)},
+        {c.qtype,c.n,c.k,c.experts},device,c.stream,c.capturing);
 }
-template<class T> T symbol(void* h, const char* name) {
-    dlerror();
-    void* p = dlsym(h, name);
-    const char* error = dlerror();
-    if (error || !p) throw std::runtime_error(std::string("quactlize: missing ABI symbol ") + name);
-    return reinterpret_cast<T>(p);
-}
-void status(int rc, const char* operation) {
-    if (rc) throw std::runtime_error(std::string("quactlize: ") + operation + " status " + std::to_string(rc));
-}
-}
-bool loaded() { return is_loaded.load(std::memory_order_acquire); }
-const Library& library() {
-    static const Library lib = [] {
-        Library l;
-        void* producer = open(location("QUACTLIZE_PPU_PACK_LIBRARY", "QUACTLIZE_PPU_BUNDLE", "libquactlize_ppu_pack.so"));
-        void* execution = open(location(nullptr, "QUACTLIZE_KPACK_EXECUTION", "libquactlize_ppu_execution.so"));
-#define BIND(member, handle, name) l.member = symbol<decltype(l.member)>(handle, #name)
-        BIND(arrangement, producer, quactlize_ppu_kpack_canonical_arrangement_v1);
-        BIND(sizes, producer, quactlize_ppu_kpack_sizes_for_arrangement_v1);
-        BIND(pack, producer, quactlize_ppu_prepare_fully_quantized_dev_for_arrangement_v2);
-        BIND(query, execution, quactlize_kpack_gemv_query_v1);
-        BIND(run, execution, quactlize_kpack_gemv_run_v1);
-#undef BIND
-        return l;
-    }();
-    is_loaded.store(true, std::memory_order_release);
-    return lib;
-}
-const qkg_config_v1& recipe() {
-    // An explicit correctness baseline, NOT a measured performance policy. No
-    // JIT, legacy fmt fallback, online tuning, or guessed TC selector is used.
-    static const qkg_config_v1 value{1, sizeof(qkg_config_v1), 16, 4, 1};
-    return value;
-}
-bool describe(const qkg_call_v1& c, Shape& s) {
-    s = {};
-    if (!enabled() || (c.qtype != 8 && (c.qtype < 10 || c.qtype > 14)) ||
-        c.n <= 0 || c.k <= 0 || c.experts <= 0 || c.rows <= 0) return false;
-    const auto& l = library();
-    status(l.arrangement(c.qtype, &s.arrangement), "canonical arrangement");
-    if (s.arrangement.version != 2 || s.arrangement.reserved != 0 || s.arrangement.mapping_id == 0)
-        throw std::runtime_error("quactlize: invalid producer arrangement-v2");
-    int rc = l.sizes(c.n, c.k, c.experts, c.qtype, &s.arrangement, &s.sizes);
-    if (rc == QKG_SHAPE || rc == QKG_OVERFLOW) return false;
-    status(rc, "producer size query");
-    qkg_sizes_v1 sizes{};
-    rc = l.query(&c, &recipe(), &s.arrangement, &sizes);
-    if (rc == QKG_SHAPE || rc == QKG_FORMAT || rc == QKG_OVERFLOW) return false;
-    status(rc, "consumer query");
-    const auto& b = s.sizes;
-    if (!b.raw_bytes || b.raw_bytes > std::numeric_limits<size_t>::max() ||
-        b.low_bytes > b.raw_bytes || b.high_bytes > b.raw_bytes - b.low_bytes ||
-        b.units_bytes != b.raw_bytes - b.low_bytes - b.high_bytes ||
-        sizes.low_bytes != b.low_bytes || sizes.high_bytes != b.high_bytes || sizes.units_bytes != b.units_bytes ||
-        (s.arrangement.high_bits == 0) != (b.high_bytes == 0) || sizes.workspace_bytes != 0)
-        throw std::runtime_error("quactlize: producer/consumer byte layout mismatch");
-    return true;
+void package_run(const Call& c,const Shape& s,int device) {
+    python::call("quact_run",{{c.a,c.input_type==F16?Dtype::f16:Dtype::f32,{c.rows,c.k},{c.a_row_stride,1}},
+        bytes(c.low,s.sizes.low_bytes),bytes(c.high,s.sizes.high_bytes),bytes(c.units,s.sizes.units_bytes),
+        {c.ids,Dtype::i32,{c.ids?c.rows:0}},
+        {c.output,Dtype::f32,{c.rows,c.n},{c.out_row_stride,1}}},
+        {c.qtype,c.n,c.k,c.experts,c.rows},device,c.stream,c.capturing);
 }
 } // namespace strata::ppu::quactlize

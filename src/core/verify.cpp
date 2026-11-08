@@ -13,7 +13,7 @@
 #include "strata/core/defaults_026.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
-#ifdef STRATA_NCP_GDN
+#ifdef STRATA_PPU_GDN
 #include "strata/ppu/kernels.hpp"
 #endif
 #include "strata/core/window_evict.hpp"
@@ -1241,13 +1241,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: stream create failed";
         return false;
     }
-#ifdef STRATA_NCP_GDN
+#ifdef STRATA_PPU_GDN
     try {
         // The verifier normally captures without an eager forward pass.
-        (void) strata::ppu::prepare_gdn(strata::kernels::kVerifyLongT, int(g.ssm_v_heads),
+        (void) strata::ppu::prepare_gdn(strata::kernels::kVerifyLongT, int(g.ssm_k_heads), int(g.ssm_v_heads),
                                        int(g.ssm_state_size), cs_);
     } catch (const std::exception& e) {
-        err = std::string("verify: NCP workspace: ") + e.what();
+        err = std::string("verify: actlizeLA preparation: ") + e.what();
         return false;
     }
 #endif

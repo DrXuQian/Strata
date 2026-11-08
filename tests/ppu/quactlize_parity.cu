@@ -133,15 +133,15 @@ void dense_cases(cudaStream_t stream) {
 // Fixture preparation, outside the runtime adapter and graph capture. This
 // calls the same shared producer as strata-ppu-pack, then reads bytes to disk.
 std::vector<uint8_t> prepare(const Weight& w, int q, int n, int k, qz::Shape* shape = nullptr) {
-    qkg_call_v1 c{}; c.version=1; c.size=sizeof(c); c.qtype=q; c.n=n; c.k=k;
-    c.experts=c.rows=c.channels=c.topk=1; c.a_row_stride=k; c.out_row_stride=n;
+    qz::Call c{}; c.qtype=q; c.n=n; c.k=k;
+    c.experts=c.rows=1; c.a_row_stride=k; c.out_row_stride=n;
     qz::Shape desc;
     require(qz::describe(c,desc), "offline fixture shape declined");
     if (shape) *shape=desc;
     Device<uint8_t> src(w.raw), packed(w.raw.size());
     auto* high=desc.sizes.high_bytes ? packed.p+desc.sizes.low_bytes : nullptr;
-    require(!qz::library().pack(src.p,packed.p,high,packed.p+desc.sizes.low_bytes+desc.sizes.high_bytes,
-        n,k,1,q,&desc.arrangement,nullptr), "offline fixture producer failed");
+    c.low=packed.p;c.high=high;c.units=packed.p+desc.sizes.low_bytes+desc.sizes.high_bytes;
+    int dev=0;ck(cudaGetDevice(&dev));qz::package_pack(src.p,c,desc,dev);
     return packed.get(w.raw.size());
 }
 
@@ -310,7 +310,7 @@ void fallback_case(cudaStream_t stream, bool budget) {
         require(!qz::dense(dw.p,12,256,512,dx.p,qz::Input::f32,1,dy.p,stream),"cold capture did not decline");
         require(!qz::loaded(),"initialized a shared library during capture");
         ck(cudaStreamEndCapture(stream,&g)); ck(cudaGraphDestroy(g));
-        qz::library();
+        qz::Call c{};c.qtype=12;c.n=256;c.k=512;qz::Shape s;require(qz::describe(c,s),"package preparation");
     }
     if (budget) require(qz::preload(dw.p,12,256,512) == 0,"zero cache budget ignored");
     require(!qz::dense(dw.p,budget ? 12 : 21,256,512,dx.p,qz::Input::f32,1,dy.p,stream),"decline expected");
@@ -334,7 +334,6 @@ int main(int argc, char** argv) {
     try {
         int ndev = 0; auto rc = cudaGetDeviceCount(&ndev);
         if (rc != cudaSuccess || !ndev) { std::fprintf(stderr,"SKIP: no usable CUDA/PPU device\n"); return 77; }
-        if (mode != "fallback") qz::library(); // The fallback fixture first checks a cold capture.
         cudaStream_t stream; ck(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
         if (mode == "dense") dense_cases(stream);
         else if (mode == "offline") offline_case(stream);

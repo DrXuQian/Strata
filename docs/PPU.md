@@ -1,397 +1,202 @@
-# PPU: Qwen3.8-Flash-Next
+# PPU: installed operator packages
 
-This is an opt-in Linux source build. It uses the PPU SDK's CUDA-compatible
-runtime and ACBLAS, and the existing `ncp_flash_lib` libraries. The normal CUDA,
-HIP and SYCL builds do not enable this backend.
+This opt-in backend targets Qwen3.8-Flash-Next on PPU1.0 / ZW810. The engine uses
+the PPU SDK's CUDA-compatible runtime and ACBLAS. Strata contains the adaptation
+layer; operator packages are installed normally and remain unchanged.
 
-## Build
+| Operation | Installed provider | Strata integration |
+| --- | --- | --- |
+| Selected-cell prompt attention | `flash-attention-for-sail` (`flash_attn_2_cuda.fwd`) | FP16 Tensor views and caller-owned output |
+| Prompt expert GEMMs | `DeepGEMM-for-sail` (`deep_gemm.m_grouped_bf16_gemm_nt_nopad`) | BF16 Tensor views; package owns its JIT |
+| GDN prefill, verification, accepted-prefix commit | `actlizeLA` (`actlize_la.serving.PreparedGDNCore`) | BF16 Q/K/V/beta, FP32 log gate and KV state; prepared workspaces |
+| Quantized dense and routed expert matrices | `QUactlize` | Strata Tensor binding JIT-compiles the installed canonical producer and GEMV kernels |
 
-Use CMake 3.24 or newer. Select a CUDA architecture that your **PPU SDK** maps to
-the intended device. The architecture name alone does not prove a PPU generation:
-the local SDK 2.1.1 wrapper also maps `sm_90a` to an older PPU target. Do not define
-`__CUDA_ARCH__` or `ACOMPUTE_VERSION` to override the compiler's target.
+There is no `libncp_*.so` loader, copied operator C ABI header, or requirement to
+build an adapter in an operator repository. Strata embeds the selected Python
+interpreter and passes borrowed DLPack views. It does not link LibTorch's C++ ABI.
+The original Strata raw-weight CPU offload, predictive fills, cache swaps and
+prefill loans remain in use.
 
-Use the SDK's runtime environment as well as its compiler. The CUDA compatibility
-libraries load `libhggcrt` and ACBLAS at runtime; a headers/compiler-only SDK can
-build the program but cannot execute it.
+## Install and build
 
-For an SDK exposing the CUDA-compatible `80` target:
+Use the PPU platform's Torch in one Python environment. Install the four operator
+packages in that same environment. Existing FlashAttention and DeepGEMM host
+extensions are used through their Tensor APIs. DeepGEMM prepares its own kernels.
+
+A complete actlizeLA serving wheel is used directly. With a host/source install,
+Strata invokes the installed package's existing serving CMake target in its JIT
+cache, then uses the same prepared Python interface. QUactlize uses the K-pack/JIT interfaces from its `develop` branch (including
+`quactlize/runtime/compiler.py` and `quactlize/packing/word_pack.hpp`). It needs its installed
+JIT source/header closure, including the pinned actlize dependency. A minimal
+host wheel that omits those files cannot supply them. Editable pip installs of
+complete source trees work without changing any operator files:
 
 ```sh
-cmake -S . -B build-ppu \
-  -DSTRATA_ENABLE_PPU=ON \
+# Only needed if these packages are not already installed with their sources.
+python -m pip install --no-build-isolation -e /path/to/actlizeLA
+python -m pip install --no-build-isolation -e /path/to/QUactlize
+```
+
+Paths above are installation inputs. The engine discovers packages through
+Python imports; it takes no llama.cpp or operator-source command-line path.
+Missing sources, a missing selected entry, or a corrupt packaged library produce
+an explicit error. No incompatible binary or CPU computation substitutes for a
+requested provider.
+
+Activate that environment and the normal SDK environment, then build:
+
+```sh
+export PPU_SDK=/path/to/complete/PPU_SDK
+export PPU_CUDA_ARCH=80
+export STRATA_PPU_TARGET=ppu10
+export CUDA_VISIBLE_DEVICES=0
+export LD_LIBRARY_PATH="$PPU_SDK/CUDA_SDK/lib64:$PPU_SDK/lib:$PPU_SDK/targets/x86_64-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+cmake -S . -B build-ppu-python \
+  -DSTRATA_ENABLE_PPU=ON -DCMAKE_CUDA_ARCHITECTURES=80 \
   -DCMAKE_CUDA_COMPILER="$PPU_SDK/CUDA_SDK/bin/nvcc" \
   -DCUDAToolkit_ROOT="$PPU_SDK/CUDA_SDK" \
-  -DCMAKE_CUDA_ARCHITECTURES=80 \
-  -DSTRATA_BUILD_TESTS=OFF \
+  -DPython3_EXECUTABLE="$(python -c 'import sys; print(sys.executable)')" \
   -DCMAKE_BUILD_TYPE=Release
-cmake --build build-ppu --target strata ncp_parity -j 3
+cmake --build build-ppu-python \
+  --target strata strata-ppu-pack ppu_package_parity quactlize_parity -j 3
 ```
 
-`STRATA_GGML_DIR` supplies ggml's CPU expert implementation. Omitting it fetches
-Strata's pinned llama.cpp. This does not link llama.cpp's CUDA backend or its
-private kernel implementations into Strata.
+CMake requires Python 3.10+ with embedding headers/library. It copies the Strata
+adapter into the build directory. Keep that directory and Python environment
+with the executable. Changing Python's major/minor version needs a rebuild;
+ordinary compatible operator package updates do not.
 
-The box script's `LLAMA_CPP_DIR` is also optional. Leave it unset to fetch that
-pinned source; set it to an existing checkout for an offline build or to reuse
-local CPU ggml sources. The engine links ggml statically and needs no llama.cpp
-checkout or executable at runtime. NCP and quactlize use their shared libraries
-directly.
+`STRATA_PPU_FA`, `STRATA_PPU_MOE`, `STRATA_PPU_GDN`, and `STRATA_QUACTLIZE` are
+CMake options enabled by `STRATA_ENABLE_PPU`. The first three also have runtime
+switches of the same name, default on. Runtime quantized execution requires
+`STRATA_QUACTLIZE=1`. All features remain off in a normal non-PPU build. NVIDIA
+MMQ, clusters and PDL remain disabled in the PPU build. ACBLAS handles prompt
+shapes outside the installed operators' admitted paths.
 
-Place these files beside `build-ppu/strata` (and beside `ncp_parity` for tests),
-or provide their directory through `LD_LIBRARY_PATH`:
+## Updating operators and preparing JIT
 
-| Library | Required entry |
+Use `python -m pip install -U ...` in the selected environment, then restart
+Strata. For editable installs, update the installed source checkout and restart.
+Strata keeps native images and graph owners alive for the process lifetime.
+
+`STRATA_PPU_JIT_CACHE` defaults to `~/.cache/strata/ppu`.
+`STRATA_PPU_JIT_JOBS` defaults to 2 for actlizeLA's build; `CMAKE` selects its CMake
+executable. Cache identities include operator sources/headers, adapter sources,
+compiler/SDK identity, flags and Python ABI. Entries are locked during build and
+have image checksums. Kernel-only updates invalidate the affected JIT entry.
+QUactlize compiler flags and runtime libraries come from the installed package.
+
+```sh
+PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}" python -m strata_ppu --prepare
+```
+
+This discovers the packages and prepares native images. It does not establish
+numerical parity. Preparation/import/JIT happens before capture; replay launches
+the captured device work without Python, compilation, or host routing readback.
+
+## Offline weights and offload
+
+Two prepared directories have distinct purposes:
+
+| Setting | Contents |
 | --- | --- |
-| `libncp_fa.so` | `ncp_flash_attn_fwd_v3` |
-| `libncp_moe.so` | `ncp_m_grouped_gemm_bf16_bf16_bf16_nt_nopad` |
-| `libncp_gdn.so` | `ncp_gdn_recurrent` |
-| Same GDN library, optional chunked path | `ncp_gdn_chunked_bf16`, `ncp_gdn_chunked_bf16_workspace_size` |
-
-The executables carry an `$ORIGIN` runpath. Library handles remain open for the
-process lifetime because captured graphs may still reference their code.
-No Torch, Triton or CUTLASS headers are required by this build.
-
-The declarations in `include/strata/ppu/ncp-*-lib.h` are copied from the local
-llama.cpp revision `2f288debe17e4acd261dcb86961f3a93ce8a26f2`. The GDN library must
-include **`(H, HV, S) = (16, 48, 128)`** for this model. Strata pairs value heads
-with Q/K by `hv % 16`, while FLA groups three value heads per Q/K head. The adapter
-permutes V, gate, beta and state to FLA order and restores output/state to Strata
-order. Q/K retain their 16 heads. No additional `(48,48,128)` specialization or
-library ABI change is needed.
-
-## Execution paths
-
-| Operation | PPU path |
-| --- | --- |
-| Dense prompt projections | Existing dequantization and FP32-accumulating ACBLAS GEMMs |
-| Prompt expert gate/up and down | Existing expert order and staging, then NCP NoPad with one expert per call; BF16 operands/output |
-| GDN prompt processing | BF16 chunked NCP for lengths divisible by 64 and at least 128; otherwise FP32 recurrent NCP |
-| Eager GDN single-token decode | FP32 recurrent NCP, state converted back to Strata's layout |
-| Speculative GDN verification | FP32 recurrent NCP with the final state discarded; the existing commit replays the accepted prefix |
-| QSA prompt attention | Gather the exact selected cells through the page table, then FP16 NCP FA, one query per call |
-| QSA decode / batched slots | Existing kernels with device-resident lengths |
-
-GDN scratch is bounded to 256 tokens of Q/K/V. The state conversion is between
-Strata's `[K,HV,V]`, recurrent NCP's `[HV,V,K]`, and chunked NCP's `[HV,K,V]`.
-Raw gates and sigmoid beta are passed unchanged. Output normalization retains
-Flash-Next's sigmoid gate.
-
-QSA supports FP16 and Q8 KV pools in the NCP prompt adapter. It uses the fully
-resident pool or prefill's complete staging pool; ring caches retain Strata's path.
-Selection already enforces causality, so the gathered cells use full attention,
-without another causal mask. Q4/mixed/rotated pools retain Strata's path. The FA ABI takes sequence
-lengths on the host; graph-replayed decode cannot bake in its changing lengths.
-
-NVIDIA MMQ, programmatic dependent launch and CTA cluster kernels are disabled
-for PPU. The existing SIMT decode kernels remain available. The PPU branch of
-the native MMVQ address helper uses C++ unsigned address arithmetic to avoid the
-SDK 2.1.1 `mad.wide` pointer-lowering compiler crash.
-
-This does not implement persistent BF16 expert repacking, grouped multi-expert
-NCP decode, NCP state snapshots, or NCP FA decode with device-side lengths.
-DeepSeek and the separate `strata-split` engine are rejected by this build mode.
-
-## Quactlize
-
-Build with `-DSTRATA_QUACTLIZE=ON` (the PPU build's default), then opt in at
-process startup with `STRATA_QUACTLIZE=1`. The runtime default is off. This uses
-the same additive producer/execution C ABI as the local llama.cpp, with no
-changes to the shared libraries:
+| `--pack DIR` | Original Strata index, dense weights and tokenizer |
+| `STRATA_QUACTLIZE_PACK=DIR` | Canonical K-pack planes and GPU expert blobs |
 
 ```sh
-export QUACTLIZE_PPU_BUNDLE=/path/to/quactlize/producer-directory
-export QUACTLIZE_KPACK_EXECUTION=/path/to/quactlize/execution-directory
-export STRATA_QUACTLIZE=1
+python tools/iq_pack.py --gguf "$MODEL" --out "$STRATA_PACK" --compat-bf16
+build-ppu-python/strata-ppu-pack --gguf "$MODEL" --out "$KPACK"
+
+STRATA_QUACTLIZE=1 STRATA_QUACTLIZE_PACK="$KPACK" \
+  build-ppu-python/strata generate --gpu 0 --pack "$STRATA_PACK" --native "$MODEL" \
+  --tokens-file "$PROMPT_IDS" --prefill 128 --spec 4 \
+  --max-context 4096 --max-new 32 --kv int8 --greedy --stats
 ```
 
-The first directory contains `libquactlize_ppu_pack.so`; the second contains
-`libquactlize_ppu_execution.so`. `QUACTLIZE_PPU_PACK_LIBRARY=/absolute/file.so`
-overrides the producer path, as in llama.cpp. An explicitly enabled integration
-with a missing/incompatible library fails with its path or missing symbol.
+`MODEL` is the first GGUF shard; both preparers discover the remaining shards.
+`--compat-bf16` is needed for the supplied UD-Q4_K_XL pack. Strata's GGUF Python
+reader may use an installed compatible `gguf` package; `STRATA_GGUF_PY` remains
+an optional setup-time override. Runtime has no llama.cpp dependency. CMake
+uses Strata's pinned ggml dependency unless `STRATA_GGML_DIR` is explicitly set.
 
-| Path | Shuffle and computation |
-| --- | --- |
-| Immutable native dense/head weights | GPU shuffle at load into a bounded resident K-pack cache; ready event waited by readers, including graph capture |
-| Dense decode and native prompt GEMMs | Arrangement-aware K-pack GEMV, with F16/F32 inputs; Q8_1-only callers expand their existing activation values first |
-| Prompt expert gate/up | Pack the current contiguous `[gate; up]` blob; convert the result to Strata's interleaved output order |
-| Grouped expert decode | Gather the current device-selected pointers in batches of eight, shuffle, run indexed GEMV, and restore entry/destination order |
-| Expert down | Quactlize when its type/geometry is admitted; otherwise the original down kernel, or NCP/ACBLAS prompt path |
+The K-pack output must be a new directory. It is published atomically after
+preparation. The version-1 container and canonical layouts remain compatible
+with previously prepared packs: startup compares the actual installed producer's
+descriptor and plane sizes before using them. A changed layout is rejected and
+requires repacking. Source identity, per-record corruption checks, complete
+expert sets, and geometry checks remain enforced.
 
-The GPU producer supplies the canonical layout descriptor. Both producer and
-consumer must accept it and agree on every plane size. Supported formats are
-Q8_0 and Q2_K through Q6_K, subject to the loaded library's geometry checks.
-The current consumer requires N and K multiples of 256; Q3_K/Q6_K need K a
-multiple of 512. Flash-Next's merged gate/up is N=1280, K=2560. Its individual
-640-row gate/up and K=640 down are not admitted separately. IQ and Q2_0 packs
-retain their original expert kernels; enabling quactlize does not change their
-quantization format.
+GPU expert blobs contain packed merged gate/up followed by original down bytes,
+with unchanged size/down offset. Initial fill, predictive prefetch, swaps,
+refill and prompt loans use the converted source. CPU execution and CPU
+complement eviction use the original raw GGUF source. Packed grouped execution
+reads fresh device routing and expert pointers on replay. Offline execution
+never shuffles model weights at runtime. Raw PCIe misses retain their raw reader.
 
-Without `STRATA_QUACTLIZE_PACK`, dynamic experts are shuffled again after
-selection. Their raw pointers can change content during
-adaptive swaps, PCIe staging and prompt loans. No packed expert is cached by
-pointer, and graph replay repacks the current contents without reading IDs on
-the host. This preserves CPU offload, prefetch and cache policies. It adds GPU
-gather/shuffle work and is not the byte-neutral persistent-buffer integration
-used in llama.cpp.
+Supported K-pack types are Q8_0 and Q2_K through Q6_K, with N/K divisible by 256
+and Q3_K/Q6_K K divisible by 512. Other shapes/types retain their original raw
+reader. Converted experts fail closed if their packed reader cannot execute.
+The current Tensor binding selects the package's scalar SIMT GEMV recipe
+(columns 16, warps 4, split 1), including multirow prompt calls. This is an
+untuned correctness baseline; it makes no speed claim and does not import a
+measured tensor-core prefill policy.
 
-The original GPU GGUF bytes also remain for immutable matrices so existing
-fused, sliced and fallback readers stay valid. `STRATA_QUACTLIZE_CACHE_MIB`
-bounds the additional resident copies per device (default 256 MiB, 0 disables
-those copies). `STRATA_QUACTLIZE_SCRATCH_MIB` bounds all retained temporary
-allocations per device (default 256 MiB). For raw inputs, allocation failure or budget exhaustion
-uses the original reader before any work is submitted. These are allocation
-budgets, not pre-reserved memory. The resident copies are charged in the native
-dense allocation report and logged individually at load.
+Additional immutable dense copies are bounded by `STRATA_QUACTLIZE_CACHE_MIB`
+(default 256); retained QUactlize scratch is bounded by
+`STRATA_QUACTLIZE_SCRATCH_MIB` (default 256). Raw-input calls can decline before
+submission if scratch is unavailable. Graph storage remains alive until process
+exit. actlizeLA's shared per-stream workspace and Python/Torch runtime memory
+are additional allocations.
 
-Scratch belongs to each output allocation/operation. It can grow outside
-capture; older storage is retained for live graphs and counts against the
-budget. A raw-input capture that needs unprepared scratch retains the original kernels.
-Prepared graph calls read fresh activation, routing and expert bytes on replay.
-Prompt ring slots are released only after all raw-weight readers finish.
+GDN converts Strata's head order and `[K,Hv,V]` state to the package's
+`[1,Hv,K,V]` order. Q scale is applied once by actlizeLA. Verification leaves the
+carried state unchanged. Commit masks the rejected suffix using the device
+acceptance count and uses the same BF16 operands/core; zero acceptance preserves
+the state exactly. Partial replay preserves earlier output rows. These are
+BF16 numerical boundaries, not bit-identical FP32 Strata recurrence. QSA decode
+keeps Strata's device-length paged attention; FlashAttention handles prompt
+selections. Session graphs on temporary streams retain their existing GDN path;
+the prepared native verifier uses the package on its owned stream.
 
-This first binding uses the shared SIMT reader with the explicit
-`columns=16, warps=4, split=1` recipe. It does not import llama.cpp's measured
-GEMV policy, TC dispatcher, JIT or automatic prefill selector. The recipe is a correctness baseline, not a measured speed choice.
-FP16 weight/activation arithmetic can differ from native integer-dot kernels;
-numerical and model A/B checks on the box are required before evaluating speed.
+## Run on the box
 
-Dispatch reports distinguish `quactlize: resident K-pack GEMV`,
-`quactlize: online shuffle + GEMV` and
-`quactlize: mutable grouped experts, online shuffle + indexed GEMV` from
-scratch/capture fallback. A loaded library alone does not show that a model
-used it.
-
-## Prepare quactlize weights offline
-
-There are two different prepared directories:
-
-| Directory | Contents and use |
-| --- | --- |
-| `--pack /path/to/strata-pack` | Strata's model index, dense tensors and tokenizer, prepared by `tools/iq_pack.py`. This is also required by the original Strata engine. |
-| `STRATA_QUACTLIZE_PACK=/path/to/quactlize-pack` | Canonical K-pack weight planes, prepared once by `strata-ppu-pack`. Only the optional quactlize integration reads it. |
-
-Prepare both on the box. Reuse an existing Strata pack if it was prepared from
-these same GGUF shards. The quactlize producer runs on the PPU during preparation;
-the shared libraries are reused without changes. No llama.cpp path is required.
-Use the SDK's normal runtime environment and set the two quactlize library paths
-shown above before running the producer.
+The end-to-end command uses the model and MTP paths supplied for this task:
 
 ```sh
-# Original Strata model preparation, once (omit if this pack already exists).
-python tools/iq_pack.py --gguf /path/to/model-00001-of-00002.gguf \
-  --out /path/to/strata-pack --compat-bf16
-
-# Add this target to the PPU build configured above.
-cmake --build build-ppu --target strata strata-ppu-pack quactlize_parity -j 3
-build-ppu/strata-ppu-pack \
-  --gguf /path/to/model-00001-of-00002.gguf \
-  --out /path/to/quactlize-pack
-
-# Check numerical parity on the box, then use the artifact for inference.
-build-ppu/quactlize_parity offline
-STRATA_QUACTLIZE=1 STRATA_QUACTLIZE_PACK=/path/to/quactlize-pack \
-  build-ppu/strata generate --gpu 0 \
-  --pack /path/to/strata-pack \
-  --native /path/to/model-00001-of-00002.gguf \
-  --tokens-file /path/to/prompt.ids \
-  --prefill 128 --spec 4 --max-context 4096 --max-new 32 --kv int8 --greedy --stats
+PPU_SDK=/path/to/complete/PPU_SDK PYTHON=python3 bash tools/ppu/run_box.sh
 ```
 
-`--gguf` discovers all shards. The output must be a new directory. Preparation
-writes a temporary sibling directory and publishes it only after the files are
-complete. It packs one tensor/expert at a time. `index.txt` records the descriptor,
-plane sizes, source identity and payload checksums; `weights.bin` holds the data.
-Keep the original GGUFs for CPU offload, unsupported matrices and token tables.
-The offline directory adds disk storage, roughly the size of its supported
-matrices and their raw expert down projections.
+It builds/checks the adapters, prepares missing model packs, creates a prompt
+with the pack's tokenizer, records a routing trace, builds a cache profile, then
+runs three model configurations with the same prompt/MTP/profile/cache: original
+providers, installed FA/DeepGEMM/actlizeLA, and those providers plus offline
+QUactlize. The cache defaults to 256 expert slots so the run can exercise GPU
+expert residency. `EXPERT_PROFILE` and `EXPERT_CACHE` override those choices.
+The trace run is profile preparation, not a benchmark.
 
-Each converted GPU expert blob contains packed merged gate/up followed by the
-original down bytes. The blob size and down offset are unchanged, so residency
-slots keep their existing sizes. Startup fill, adaptive swaps, prompt loans,
-refill and Foresight prediction all load these bytes. CPU decode and CPU prompt
-sharing still use the original source. Eviction into a CPU RAM slot reloads
-raw bytes from that source rather than copying the packed GPU slot back.
-Ordinary PCIe miss staging stays raw and uses the original expert kernels.
+Defaults are:
 
-Offline prompt gate/up reads the packed planes and interleaves its output in
-place. Grouped decode gathers the already packed planes for the shared indexed
-reader; it does **no runtime shuffle**. This still adds gather and activation
-conversion work. Down remains on the original kernel or NCP/ACBLAS prompt path.
-Immutable dense/head copies load from disk within `STRATA_QUACTLIZE_CACHE_MIB`;
-a missing or over-budget dense record keeps the raw reader. The original dense
-GPU allocations remain for sliced and fused readers.
+- `MODEL_DIR=/sim/eec/shared/AI_workspace/llm-models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL`
+- `MTP_RT=/sim/eec/shared/AI_workspace/llm-models/MTP-GGUF-modelzoo/Qwen3.8-Flash-Next-MTP/rt`
+- `BUILD_DIR=build-ppu-python`, `PPU_CUDA_ARCH=80`, one visible device.
 
-The runtime adapter forbids invoking the producer in offline mode. A converted
-expert cannot fall back to a raw reader: insufficient scratch, unsupported graph
-capture or mismatched layout stops with an error. Increase
-`STRATA_QUACTLIZE_SCRATCH_MIB` if needed. Warm the same grouped operation before
-capture so its temporary storage exists. Producer/consumer descriptor and plane
-sizes must agree with the artifact. Both existing DSOs are still needed at
-runtime for admission; the producer's shuffle entry is used only by preparation.
+Run `bash tools/ppu/run_box.sh --help` for directory/command overrides. Existing
+Strata and K-pack directories are reusable with `STRATA_MODEL_PACK` and
+`STRATA_QUACTLIZE_PACK`. MTP takes the runtime directory containing `dense.txt`,
+`dense.bin`, and `experts.bin`; use `WITH_MTP=0` to omit it. Native packs still
+require `--spec >= 2`. Native loading discovers the PLE shard automatically.
 
-This mode currently requires `--native` and one visible GPU (`--gpu 0`); peer,
-remote and layer-split caches are rejected. Q8_0/Q2_K–Q6_K merged gate/up must
-satisfy the consumer geometry. IQ, Q2_0, scaled-down layouts and NVFP4 down remain
-raw. No quantization format is changed. The file identity check binds the artifact
-to the canonical GGUF paths, sizes, inode/device and modification timestamps.
-Moving/replacing a shard requires preparing again. Keep model and artifact files
-immutable during use. Per-record FNV-1a detects accidental corruption; it is not
-a cryptographic authentication scheme.
+For custom engine arguments use `bash tools/ppu/check.sh -- <generate args>`.
+`STRATA_CHECK_MODEL_ONLY=1` reuses a previously checked build for the model runs.
+Logs include package locations/versions, source/build identities, individual
+operator results, model output, and dispatch reports. Check that packed expert
+and provider dispatch counts are nonzero. Process exit alone does not establish
+model quality, token equivalence, or performance.
 
-For the three model A/B runs below, add
-`STRATA_QUACTLIZE_PACK=/path/to/quactlize-pack` to the environment. The two runs
-with quactlize disabled ignore it. Dispatch reports include
-`quactlize: offline expert GEMV` and
-`quactlize: offline grouped experts, no shuffle`. Confirm these counters before
-interpreting timings. Source compilation alone establishes no speedup.
-
-## Controls and diagnostics
-
-`STRATA_NCP_FA`, `STRATA_NCP_MOE` and `STRATA_NCP_GDN` are CMake options, defaulting
-to ON only in a PPU build. The same environment variable names accept `0`,
-`false` or `off` to disable individual libraries at process startup.
-`STRATA_NCP_GDN_CHUNKED=0` selects recurrent GDN for prompt processing too.
-
-When using `setup.py`, `STRATA_SKIP_DRIVER_CHECK=1` skips its minimum NVIDIA
-driver-version check for the PPU compatibility runtime. The default check stays
-enabled. Select the PPU compiler and backend with the CMake options above.
-
-Missing libraries, old FA symbols and unsupported shapes keep the existing
-Strata computation. GDN module-load and workspace errors are reported as errors.
-The adapter does not write carried state until the whole NCP operation succeeds;
-a declined call's output is overwritten by the fallback.
-
-Set `STRATA_DISPATCH_REPORT=/path/to/dispatch.json` to distinguish a library
-being loaded from an NCP path actually being selected. The report includes
-`ppu: NCP GDN recurrent`, `ppu: NCP GDN chunked`, `ppu: NCP NoPad expert GEMM`
-and `ppu: NCP selected-cell FlashAttention` counters.
-
-Scratch is separate per device, stream and operation. The verifier reserves its
-recurrence scratch at initialization, before its first capture. Allocation growth occurs
-outside capture; old addresses are retained for existing graphs. Capturing before
-sufficient scratch has been prepared uses the existing kernels. Only the verifier
-opts into captured NCP recurrence and replays on its original stream. The session
-graphs captured on temporary streams retain Strata's kernels, even if a reused
-stream address happens to have cached scratch.
-
-NCP BF16/FP16 conversion and accumulation may differ from the default kernels.
-These paths are not claimed to be bit-identical or faster without a device and
-model comparison. The existing graph/capture and expert residency policies remain
-the basis of execution.
-
-## Validation
-
-On the PPU box, this command builds the engine and runs all seven device checks
-against the shared libraries. It does not build or replace those libraries. Any
-missing device/library or failed fixture stops the command:
-
-```sh
-PPU_SDK=/path/to/PPU_SDK \
-NCP_LIB_DIR=/path/to/shared/ncp-libs \
-PPU_CUDA_ARCH=80 \
-bash tools/ppu/check.sh
-```
-
-Choose the architecture for the box's SDK. To run the same prepared
-Qwen3.8-Flash-Next model with NCP disabled and enabled after those checks, append
-the engine arguments. Use a real pretokenized prompt of at least 128 tokens to
-exercise chunked prefill, and the GGUF shard that contains the PLE table:
-
-```sh
-PPU_SDK=/path/to/PPU_SDK \
-NCP_LIB_DIR=/path/to/shared/ncp-libs \
-PPU_CUDA_ARCH=80 \
-bash tools/ppu/check.sh -- \
-  --pack /path/to/strata-pack \
-  --native /path/to/model-00001-of-00002.gguf \
-  --ple-gguf /path/to/model-00002-of-00002.gguf \
-  --tokens-file /path/to/prompt.ids \
-  --prefill 128 --spec 4 --max-context 4096 --max-new 32 --kv int8 --greedy --stats
-```
-
-The shard names are examples; use this pack's actual files. Native packs require
-`--spec` of at least 2, including runs without an MTP drafter. To use an existing
-MTP runtime pack, append `--mtp /path/to/mtp/rt`; this directory must contain
-`dense.txt`, `dense.bin` and `experts.bin`. The CUDA/PPU loader takes the runtime
-directory, not the MTP GGUF filename. If only the GGUF exists, prepare it with
-`python tools/mtp_rt.py --gguf /path/to/mtp-q2_0.gguf --out /path/to/mtp/rt`.
-Pass the same MTP, expert-cache and other model arguments to all runs through
-this command.
-Logs, binary/library hashes and dispatch reports go into a dated directory under
-`build-ppu`. Model output equivalence and performance still need to be assessed
-from the saved runs; a zero process exit code does not establish either result.
-
-Loader tests require only a C++17 compiler and Python:
-
-```sh
-python tests/ppu/test_loader.py --build-dir /workspace/strata-ppu-loader-tests
-python tests/ppu/test_quactlize_loader.py --build-dir /workspace/strata-quactlize-loader-tests
-python tests/ppu/test_offline_store.py --build-dir /workspace/strata-offline-store-tests
-```
-
-They use ABI fixture libraries, not simulated model computations, to check
-concurrent initialization, all exported signatures, `$ORIGIN` lookup, missing
-libraries, stale FA symbols, missing NoPad symbols, incomplete GDN libraries and
-runtime disable flags.
-
-Run numerical tests on a PPU with matching NCP libraries:
-
-```sh
-build-ppu/ncp_parity gdn-verify
-build-ppu/ncp_parity gdn-commit
-build-ppu/ncp_parity gdn-graph
-build-ppu/ncp_parity gdn-chunked
-build-ppu/ncp_parity moe
-build-ppu/ncp_parity fa
-build-ppu/ncp_parity fa-q8
-```
-
-References run on the CPU. Fixtures cover nonzero GDN state, modulo head mapping,
-verification without state writes, first-capture graph execution and the capture
-ownership guard, a 320-token chunk boundary, non-tile-aligned
-expert rows, sparse selection, permuted KV pages and different selected lengths.
-Exit 77 means a required device or library is absent; an available library that
-declines a required fixture fails the test. These are physical-device tests with
-packing and output kernels, not single-launch simulator inputs.
-
-Then compare the same Qwen3.8-Flash-Next pack, prompts, context, sampling and MTP
-settings with each NCP switch on and off. Check output quality, accepted draft
-tokens, memory use, prefill latency and decode throughput separately. No physical
-PPU or full-model performance result is supplied by the source build alone.
-
-To include quactlize, use the existing libraries on the box:
-
-```sh
-PPU_SDK=/path/to/PPU_SDK \
-NCP_LIB_DIR=/path/to/shared/ncp-libs \
-PPU_CUDA_ARCH=80 \
-WITH_QUACTLIZE=1 \
-QUACTLIZE_PPU_BUNDLE=/path/to/quactlize/producer-directory \
-QUACTLIZE_KPACK_EXECUTION=/path/to/quactlize/execution-directory \
-bash tools/ppu/check.sh -- \
-  --pack /path/to/strata-pack \
-  --native /path/to/model-00001-of-00002.gguf \
-  --ple-gguf /path/to/model-00002-of-00002.gguf \
-  --tokens-file /path/to/prompt.ids \
-  --prefill 128 --spec 4 --max-context 4096 --max-new 32 --kv int8 --greedy --stats
-```
-
-This builds `quactlize_parity` and `strata-ppu-pack` and adds six strict checks:
-dense, grouped, graph, fallback, budget and offline. The CPU oracle quantizes and dequantizes raw GGUF
-blocks through ggml, independently of the GPU producer. Tests include all six
-formats, strided inputs/outputs, beta, F16/F32/Q8_1 input, merged gate/up order,
-mutable expert replacement at the same address, two batches of routed groups,
-empty groups, destination scatter, cross-stream graph replay, the ready event,
-disk-loaded weights, prepacked expert replacement on graph replay, in-place
-prefill interleaving, and calls that must decline without touching output.
-The offline container tests cover corrupt/truncated files, missing experts,
-source identity and incompatible metadata without a GPU. Missing hardware returns
-77 and stops the box script; it is not a numerical pass.
-
-With model arguments, logs contain three runs: native (`NCP=0, quactlize=0`),
-NCP (`1,0`) and NCP plus quactlize (`1,1`). Compare the last two to isolate this
-change. Confirm a quactlize computation counter in `dispatch-quactlize-1.json`;
-unsupported quantization or insufficient memory can leave a model entirely on
-the original path. Quality/performance admission is still a separate review of
-the saved results. Local source compilation cannot establish a PPU box result.
+Host checks are `tests/ppu/test_bridge.py` (real CPU Torch, embedded Python,
+DLPack ownership/strides/BF16/threads/errors) `test_packages.py` (8 host interface/cache checks), and `test_offline_store.py` (19
+source/container checks). Device tests cover FA with FP16/Q8 KV, BF16 MoE,
+GDN verification/commit/chunks/graph/accepted-prefix/partial output, six quant
+formats, dynamic routing/weight replacement, graph replay, budgets and offline
+artifacts. A no-device exit 77 is a failed box validation, not a pass.

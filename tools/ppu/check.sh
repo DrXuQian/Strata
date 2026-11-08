@@ -1,120 +1,67 @@
 #!/usr/bin/env bash
-# Build Strata against the PPU SDK and the existing, shared NCP libraries.
-# Optional arguments after -- are passed unchanged to `strata generate` for A/B runs.
+# Build and check the installed-package PPU backend. Arguments after -- are
+# passed to all three model A/B runs without changing model/cache settings.
 set -euo pipefail
-
-: "${PPU_SDK:?Set PPU_SDK to the complete PPU SDK root}"
-: "${NCP_LIB_DIR:?Set NCP_LIB_DIR to the existing libncp_fa/moe/gdn.so directory}"
-: "${PPU_CUDA_ARCH:?Set PPU_CUDA_ARCH to the explicit CUDA target supported by your PPU SDK}"
-
-# Optional local CPU ggml source. An empty value selects Strata's pinned
-# FetchContent dependency and clears a local path cached by an earlier build.
-ggml_dir=${LLAMA_CPP_DIR:-}
-
+: "${PPU_SDK:?Set PPU_SDK to the complete installed SDK}"
+export PPU_CUDA_ARCH=${PPU_CUDA_ARCH:-80}
+export STRATA_PPU_TARGET=${STRATA_PPU_TARGET:-ppu10}
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-build=${BUILD_DIR:-"$repo/build-ppu"}
+build=${BUILD_DIR:-"$repo/build-ppu-python"}
 out=${OUT_DIR:-"$build/check-$(date -u +%Y%m%dT%H%M%SZ)"}
 cmake_bin=${CMAKE:-cmake}
-with_quactlize=${WITH_QUACTLIZE:-0}
-if [[ "$with_quactlize" != 0 && "$with_quactlize" != 1 ]]; then
-    printf 'WITH_QUACTLIZE must be 0 or 1\n' >&2
-    exit 1
-fi
-targets=(strata ncp_parity)
-if [[ "$with_quactlize" == 1 ]]; then
-    : "${QUACTLIZE_KPACK_EXECUTION:?Set the existing quactlize execution library directory}"
-    if [[ -z ${QUACTLIZE_PPU_PACK_LIBRARY:-} ]]; then
-        : "${QUACTLIZE_PPU_BUNDLE:?Set the existing quactlize producer library directory}"
-        export QUACTLIZE_PPU_PACK_LIBRARY="$QUACTLIZE_PPU_BUNDLE/libquactlize_ppu_pack.so"
-    fi
-    for lib in "$QUACTLIZE_PPU_PACK_LIBRARY" "$QUACTLIZE_KPACK_EXECUTION/libquactlize_ppu_execution.so"; do
-        if [[ ! -r "$lib" ]]; then printf 'Missing shared quactlize library: %s\n' "$lib" >&2; exit 1; fi
-    done
-    targets+=(quactlize_parity strata-ppu-pack)
-fi
+python_bin=${PYTHON:-python3}
+python_bin=$("$python_bin" -c 'import sys; print(sys.executable)')
+export LD_LIBRARY_PATH="$PPU_SDK/CUDA_SDK/lib64:$PPU_SDK/lib:$PPU_SDK/targets/x86_64-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PYTHONPATH="$repo/python${PYTHONPATH:+:$PYTHONPATH}"
 if [[ ${1:-} == -- ]]; then shift; fi
-
-for lib in fa moe gdn; do
-    if [[ ! -r "$NCP_LIB_DIR/libncp_${lib}.so" ]]; then
-        printf 'Missing shared NCP library: %s\n' "$NCP_LIB_DIR/libncp_${lib}.so" >&2
-        exit 1
-    fi
-done
 mkdir -p -- "$out"
 out=$(cd -- "$out" && pwd)
-export LD_LIBRARY_PATH="$NCP_LIB_DIR:$PPU_SDK/CUDA_SDK/lib64:$PPU_SDK/lib:$PPU_SDK/targets/x86_64-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-if [[ "$with_quactlize" == 1 ]]; then
-    export LD_LIBRARY_PATH="$QUACTLIZE_KPACK_EXECUTION:$(dirname -- "$QUACTLIZE_PPU_PACK_LIBRARY"):$LD_LIBRARY_PATH"
-fi
-
+provenance="$out/provenance.txt"
+if [[ ${STRATA_CHECK_MODEL_ONLY:-0} == 1 ]]; then provenance="$out/provenance-model.txt"; fi
 {
     date -u +'%Y-%m-%dT%H:%M:%SZ'
     git -C "$repo" rev-parse HEAD
     git -C "$repo" status --short
     git -C "$repo" diff --binary HEAD | sha256sum
-    sha256sum "$repo/cmake/ppu_backend.cmake" "$repo"/src/ppu/* "$repo"/include/strata/ppu/*.h \
-        "$repo"/include/strata/ppu/*.hpp "$repo"/include/strata/ppu/quactlize/*.h \
-        "$repo/tests/ppu/ncp_parity.cu" "$repo/tools/ppu/check.sh"
-    if [[ "$with_quactlize" == 1 ]]; then
-        sha256sum "$QUACTLIZE_PPU_PACK_LIBRARY" "$QUACTLIZE_KPACK_EXECUTION/libquactlize_ppu_execution.so" \
-            "$repo/tests/ppu/quactlize_parity.cu"
-        printf 'quactlize_cache_mib=%s scratch_mib=%s\n' "${STRATA_QUACTLIZE_CACHE_MIB:-256}" "${STRATA_QUACTLIZE_SCRATCH_MIB:-256}"
-    fi
-    printf 'model_args:'
-    printf ' %q' "$@"
-    printf '\n'
-    printf 'cpu_ggml_source: %s\n' "${ggml_dir:-Strata pinned upstream (CMake FetchContent)}"
+    printf 'python=%s target=%s cuda_arch=%s\n' "$python_bin" "$STRATA_PPU_TARGET" "$PPU_CUDA_ARCH"
+    printf 'model_args:'; printf ' %q' "$@"; printf '\n'
     "$PPU_SDK/CUDA_SDK/bin/nvcc" --version
-    sha256sum "$NCP_LIB_DIR/libncp_fa.so" "$NCP_LIB_DIR/libncp_moe.so" "$NCP_LIB_DIR/libncp_gdn.so"
-} > "$out/provenance.txt"
+} > "$provenance"
+
+if [[ ${STRATA_CHECK_MODEL_ONLY:-0} != 1 ]]; then
+# Pure host checks, followed by real package discovery/JIT. A no-device skip
+# is a failure of this box command, not a successful numerical measurement.
+"$python_bin" "$repo/tests/ppu/test_bridge.py" --build-dir "$out/bridge" 2>&1 | tee "$out/bridge.log"
+"$python_bin" "$repo/tests/ppu/test_offline_store.py" --build-dir "$out/offline-store" 2>&1 | tee "$out/offline-store.log"
+"$python_bin" "$repo/tests/ppu/test_packages.py" -v 2>&1 | tee "$out/package-contracts.log"
+"$python_bin" -m strata_ppu --prepare 2>&1 | tee "$out/packages.log"
 
 "$cmake_bin" -S "$repo" -B "$build" \
-    -DSTRATA_ENABLE_PPU=ON \
-    -DSTRATA_NCP_FA=ON -DSTRATA_NCP_MOE=ON -DSTRATA_NCP_GDN=ON -DSTRATA_QUACTLIZE=ON \
+    -DSTRATA_ENABLE_PPU=ON -DSTRATA_PPU_FA=ON -DSTRATA_PPU_MOE=ON -DSTRATA_PPU_GDN=ON -DSTRATA_QUACTLIZE=ON \
     -DCMAKE_CUDA_COMPILER="$PPU_SDK/CUDA_SDK/bin/nvcc" \
-    -DCUDAToolkit_ROOT="$PPU_SDK/CUDA_SDK" \
-    -DCMAKE_CUDA_ARCHITECTURES="$PPU_CUDA_ARCH" \
-    -DSTRATA_GGML_DIR="$ggml_dir" \
+    -DCUDAToolkit_ROOT="$PPU_SDK/CUDA_SDK" -DCMAKE_CUDA_ARCHITECTURES="$PPU_CUDA_ARCH" \
+    -DPython3_EXECUTABLE="$python_bin" -DSTRATA_GGML_DIR="${STRATA_GGML_DIR:-}" \
     -DSTRATA_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release 2>&1 | tee "$out/configure.log"
-"$cmake_bin" --build "$build" --target "${targets[@]}" -j "${JOBS:-3}" 2>&1 | tee "$out/build.log"
-sha256sum "$build/strata" "$build/ncp_parity" >> "$out/provenance.txt"
-
-for case_name in gdn-verify gdn-commit gdn-graph gdn-chunked moe fa fa-q8; do
-    # Exit 77 (no device/library) is a failure of this box validation command.
-    # The executable itself distinguishes that skip from a numerical failure.
-    env STRATA_NCP_FA=1 STRATA_NCP_MOE=1 STRATA_NCP_GDN=1 STRATA_NCP_GDN_CHUNKED=1 \
-        "$build/ncp_parity" "$case_name" 2>&1 | tee "$out/$case_name.log"
+"$cmake_bin" --build "$build" --target strata strata-ppu-pack ppu_package_parity quactlize_parity \
+    -j "${JOBS:-3}" 2>&1 | tee "$out/build.log"
+sha256sum "$build/strata" "$build/strata-ppu-pack" "$build/ppu_package_parity" "$build/quactlize_parity" >> "$provenance"
+for test_case in gdn-verify gdn-commit gdn-graph gdn-prefix gdn-partial gdn-chunked moe fa fa-q8; do
+    env STRATA_PPU_FA=1 STRATA_PPU_MOE=1 STRATA_PPU_GDN=1 \
+        "$build/ppu_package_parity" "$test_case" 2>&1 | tee "$out/$test_case.log"
 done
-if [[ "$with_quactlize" == 1 ]]; then
-    sha256sum "$build/quactlize_parity" "$build/strata-ppu-pack" >> "$out/provenance.txt"
-    if [[ -n ${STRATA_QUACTLIZE_PACK:-} ]]; then
-        printf 'offline_quactlize_pack: %s\n' "$STRATA_QUACTLIZE_PACK" >> "$out/provenance.txt"
-        sha256sum "$STRATA_QUACTLIZE_PACK/index.txt" >> "$out/provenance.txt"
-        # The manifest checks each loaded payload. Do not scan the entire model
-        # here: that would warm the filesystem cache before the first A/B run.
-        stat --printf='offline_weights_bytes=%s mtime=%y\n' "$STRATA_QUACTLIZE_PACK/weights.bin" >> "$out/provenance.txt"
-    fi
-    for case_name in dense grouped graph fallback budget offline; do
-        "$build/quactlize_parity" "$case_name" 2>&1 | tee "$out/quactlize-$case_name.log"
-    done
+for test_case in dense grouped graph fallback budget offline; do
+    "$build/quactlize_parity" "$test_case" 2>&1 | tee "$out/quactlize-$test_case.log"
+done
 fi
-
 if (( $# )); then
-    for enabled in 0 1; do
-        printf 'Running model with NCP=%s\n' "$enabled"
-        env STRATA_NCP_FA="$enabled" STRATA_NCP_MOE="$enabled" STRATA_NCP_GDN="$enabled" \
-            STRATA_NCP_GDN_CHUNKED="$enabled" STRATA_QUACTLIZE=0 STRATA_DISPATCH_STATS=1 \
-            STRATA_DISPATCH_REPORT="$out/dispatch-ncp-$enabled.json" \
-            "$build/strata" generate "$@" 2>&1 | tee "$out/model-ncp-$enabled.log"
+    for providers in 0 1; do
+        env STRATA_PPU_FA="$providers" STRATA_PPU_MOE="$providers" STRATA_PPU_GDN="$providers" \
+            STRATA_QUACTLIZE=0 STRATA_DISPATCH_STATS=1 STRATA_DISPATCH_REPORT="$out/dispatch-packages-$providers.json" \
+            "$build/strata" generate "$@" 2>&1 | tee "$out/model-packages-$providers.log"
     done
-    if [[ "$with_quactlize" == 1 ]]; then
-        env STRATA_NCP_FA=1 STRATA_NCP_MOE=1 STRATA_NCP_GDN=1 STRATA_NCP_GDN_CHUNKED=1 \
-            STRATA_QUACTLIZE=1 STRATA_DISPATCH_STATS=1 \
-            STRATA_DISPATCH_REPORT="$out/dispatch-quactlize-1.json" \
-            "$build/strata" generate "$@" 2>&1 | tee "$out/model-quactlize-1.log"
-    fi
+    env STRATA_PPU_FA=1 STRATA_PPU_MOE=1 STRATA_PPU_GDN=1 STRATA_QUACTLIZE=1 STRATA_DISPATCH_STATS=1 \
+        STRATA_DISPATCH_REPORT="$out/dispatch-quactlize.json" \
+        "$build/strata" generate "$@" 2>&1 | tee "$out/model-quactlize.log"
 fi
-printf 'Checks completed. Logs: %s\n' "$out"
-if (( $# )); then
-    printf 'Compare model output, dispatch counters (including actual quactlize selection) and timings across the model logs.\n'
-fi
+printf 'Completed command checks. Logs: %s\n' "$out"
+printf 'Assess model output and dispatch counts before comparing performance.\n'
